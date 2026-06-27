@@ -24,7 +24,7 @@ except Exception:
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v25", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v26", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -34,7 +34,7 @@ HISTORY_FILE = os.path.join(DATA_DIR, "search_history.csv")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-st.title("POR Hunting Pro v25")
+st.title("POR Hunting Pro v26")
 st.caption("DART 재무 + 주가/시총 + POR/PER/PBR 밴드 + 미래 POR 시뮬레이터")
 
 
@@ -447,16 +447,18 @@ def make_valuation_df(
             "equity": r.get("equity"),
         }
 
-    if forward_year and forward_oi_eok and forward_oi_eok > 0:
-        fin_map.setdefault(int(forward_year), {})
-        fin_map[int(forward_year)]["operating_income"] = forward_oi_eok * 100_000_000
-
     if metric == "POR":
         base_col = "operating_income"
     elif metric == "PER":
         base_col = "net_income"
     else:
         base_col = "equity"
+
+    # v26: 선택한 지표 기준으로 미래 기준값 반영
+    # POR=영업이익, PER=당기순이익, PBR=자본총계
+    if forward_year and forward_oi_eok and forward_oi_eok > 0:
+        fin_map.setdefault(int(forward_year), {})
+        fin_map[int(forward_year)][base_col] = forward_oi_eok * 100_000_000
 
     latest_available = {}
     for y in sorted(out["year"].unique()):
@@ -472,7 +474,7 @@ def make_valuation_df(
 
     out["base_value"] = out["year"].map(latest_available)
 
-    if metric == "POR" and forward_year and forward_oi_eok and forward_oi_eok > 0:
+    if forward_year and forward_oi_eok and forward_oi_eok > 0:
         out.loc[out["year"] >= int(forward_year), "base_value"] = forward_oi_eok * 100_000_000
 
     out = out.dropna(subset=["base_value"])
@@ -639,7 +641,7 @@ def plot_valuation(val_df: pd.DataFrame, title: str, metric: str, chart_range: s
                     f"{metric}: " + "%{y:.2f}배<br>"
                     "예상 주가: %{customdata[0]:,.0f}원<br>"
                     "예상 시가총액: %{customdata[1]:,.0f}억<br>"
-                    "예상 영업이익: %{customdata[2]:,.1f}억"
+                    f"예상 {base_label}: " + "%{customdata[2]:,.1f}억"
                     "<extra></extra>"
                 ),
             )
@@ -749,10 +751,17 @@ with st.sidebar:
         step=1,
     )
 
-    forward_oi_eok = st.number_input("예상 영업이익(억원, POR 선택 시 반영)", value=0.0, step=10.0)
+    if valuation_metric == "POR":
+        expected_base_label = "예상 영업이익"
+    elif valuation_metric == "PER":
+        expected_base_label = "예상 당기순이익"
+    else:
+        expected_base_label = "예상 자본총계"
+
+    forward_oi_eok = st.number_input(f"{expected_base_label}(억원, 선택)", value=0.0, step=10.0)
     expected_mcap_eok = st.number_input("예상 시가총액(억원, 선택)", value=0.0, step=50.0)
     expected_price = st.number_input("예상 주가(원, 선택)", value=0.0, step=100.0)
-    target_por_slider = st.slider("목표 POR", 1.0, 30.0, 8.0, 0.5)
+    target_por_slider = st.slider(f"목표 {valuation_metric}", 1.0, 30.0, 8.0, 0.5)
     bear_por = st.number_input("보수 POR", value=5.0, step=0.5)
     base_por = st.number_input("적정 POR", value=8.0, step=0.5)
     bull_por = st.number_input("낙관 POR", value=12.0, step=0.5)
@@ -877,7 +886,7 @@ if run:
     projected_multiple = None
     projected_mcap_eok = None
 
-    if valuation_metric == "POR" and forward_oi_eok and forward_oi_eok > 0:
+    if forward_oi_eok and forward_oi_eok > 0:
         latest_for_projection = val_df.iloc[-1]
         current_mcap_eok_for_projection = latest_for_projection["market_cap"] / 100_000_000
 
@@ -926,7 +935,7 @@ if run:
     c5.metric("최근 매출액", f"{latest_revenue / 100_000_000:,.1f}억" if latest_revenue else "-")
     c6.metric("기준일", latest["date"].strftime("%Y-%m-%d"))
     c7.metric("차트 범위", chart_range)
-    c8.metric("예상 POR", f"{projected_multiple:.2f}" if projected_multiple else "-")
+    c8.metric(f"예상 {valuation_metric}", f"{projected_multiple:.2f}" if projected_multiple else "-")
 
     fig, mean, std, stat_count, stat_start_date, displayed_df = plot_valuation(
         val_df,
@@ -964,7 +973,7 @@ if run:
     if projected_info is not None:
         st.markdown("### 미래 POR 시뮬레이션")
         p1, p2, p3 = st.columns(3)
-        p1.metric("예상 POR", f"{projected_multiple:.2f}배")
+        p1.metric(f"예상 {valuation_metric}", f"{projected_multiple:.2f}배")
         p2.metric("예상 주가", f"{projected_info.get('price'):,.0f}원" if projected_info.get("price") else "-")
         if current_price and projected_info.get("price"):
             p3.metric("상승여력", f"{(projected_info.get('price') / current_price - 1) * 100:.1f}%")
@@ -973,12 +982,12 @@ if run:
 
         with st.expander("예상 시나리오 상세", expanded=False):
             d1, d2, d3 = st.columns(3)
-            d1.metric(f"{int(forward_year)}E 예상 영업이익", f"{forward_oi_eok:,.1f}억")
+            d1.metric(f"{int(forward_year)}E {expected_base_label}", f"{forward_oi_eok:,.1f}억")
             d2.metric("예상 시가총액", f"{projected_mcap_eok:,.0f}억")
-            d3.metric("현재 POR 대비", f"{(projected_multiple / latest['ratio'] - 1) * 100:.1f}%")
+            d3.metric(f"현재 {valuation_metric} 대비", f"{(projected_multiple / latest['ratio'] - 1) * 100:.1f}%")
 
     # v20: 목표 POR 슬라이더 계산
-    if valuation_metric == "POR" and forward_oi_eok and forward_oi_eok > 0:
+    if forward_oi_eok and forward_oi_eok > 0:
         target_mcap_eok_by_slider = target_por_slider * forward_oi_eok
         target_price_by_slider = None
         target_upside_by_slider = None
@@ -989,7 +998,7 @@ if run:
 
         st.markdown("### 목표 POR 계산기")
         t1, t2, t3 = st.columns(3)
-        t1.metric("목표 POR", f"{target_por_slider:.1f}배")
+        t1.metric(f"목표 {valuation_metric}", f"{target_por_slider:.1f}배")
         t2.metric("목표 주가", f"{target_price_by_slider:,.0f}원" if target_price_by_slider else "-")
         t3.metric("상승여력", f"{target_upside_by_slider:.1f}%" if target_upside_by_slider is not None else "-")
 
@@ -1000,14 +1009,14 @@ if run:
 
 
     # v22: POR Calculator Pro
-    if valuation_metric == "POR":
-        st.markdown("### POR Calculator Pro")
+    if valuation_metric in ["POR", "PER", "PBR"]:
+        st.markdown(f"### {valuation_metric} Calculator Pro")
 
         calc_base_eok = None
-        calc_base_label = "현재 적용 영업이익"
+        calc_base_label = "현재 적용 기준값"
         if forward_oi_eok and forward_oi_eok > 0:
             calc_base_eok = float(forward_oi_eok)
-            calc_base_label = f"{int(forward_year)}E 예상 영업이익"
+            calc_base_label = f"{int(forward_year)}E {expected_base_label}"
         elif latest["base_value"] and pd.notna(latest["base_value"]) and latest["base_value"] > 0:
             calc_base_eok = latest["base_value"] / 100_000_000
 
@@ -1022,8 +1031,8 @@ if run:
 
             cpa, cpb, cpc, cpd = st.columns(4)
             cpa.metric(calc_base_label, f"{calc_base_eok:,.1f}억")
-            cpb.metric("현재 POR", f"{current_por_calc:.2f}배")
-            cpc.metric(f"{chart_range} 평균 POR", f"{mean:.2f}배")
+            cpb.metric(f"현재 {valuation_metric}", f"{current_por_calc:.2f}배")
+            cpc.metric(f"{chart_range} 평균 {valuation_metric}", f"{mean:.2f}배")
             cpd.metric("평균 대비", f"{avg_discount:.1f}%" if avg_discount is not None else "-")
 
             # 현재 POR 주변과 주요 POR 구간을 함께 표시
@@ -1065,6 +1074,8 @@ if run:
                 )
 
             calc_df = pd.DataFrame(rows).sort_values("POR").reset_index(drop=True)
+            if valuation_metric != "POR":
+                calc_df = calc_df.rename(columns={"POR": valuation_metric})
 
             def style_por_calculator(row):
                 styles = [""] * len(row)
@@ -1088,7 +1099,7 @@ if run:
 
             show_calc_df = calc_df.copy()
             styled = show_calc_df.style.apply(style_por_calculator, axis=1).format({
-                "POR": "{:.2f}",
+                valuation_metric: "{:.2f}",
                 "목표 시가총액(억)": "{:,.1f}",
                 "목표 주가(원)": "{:,.0f}",
                 "상승여력(%)": "{:,.1f}%",
@@ -1098,7 +1109,7 @@ if run:
 
             st.caption("노란색=현재 POR, 파란색=선택 기간 평균 POR, 초록색=목표 POR입니다.")
         else:
-            st.info("POR Calculator를 표시하려면 영업이익 데이터가 필요합니다.")
+            st.info(f"{valuation_metric} Calculator를 표시하려면 기준값 데이터가 필요합니다.")
 
 
     # v25: Fair Value / Tenbagger / Simple Report
@@ -1108,10 +1119,10 @@ if run:
         scenario_base_eok = None
         if forward_oi_eok and forward_oi_eok > 0:
             scenario_base_eok = float(forward_oi_eok)
-            scenario_label = f"{int(forward_year)}E 예상 영업이익"
+            scenario_label = f"{int(forward_year)}E {expected_base_label}"
         elif latest["base_value"] and pd.notna(latest["base_value"]) and latest["base_value"] > 0:
             scenario_base_eok = latest["base_value"] / 100_000_000
-            scenario_label = "현재 적용 영업이익"
+            scenario_label = "현재 적용 기준값"
         else:
             scenario_label = "영업이익"
 
@@ -1158,7 +1169,7 @@ if run:
             ten1, ten2, ten3, ten4 = st.columns(4)
             ten1.metric("10배 시가총액", f"{ten_mcap_eok:,.0f}억")
             ten2.metric("10배 주가", f"{ten_price:,.0f}원")
-            ten3.metric("목표 POR", f"{target_por_slider:.1f}배")
+            ten3.metric(f"목표 {valuation_metric}", f"{target_por_slider:.1f}배")
             ten4.metric("필요 영업이익", f"{needed_oi_at_target_por:,.1f}억" if needed_oi_at_target_por else "-")
 
             st.markdown("### AI 스타일 요약")
