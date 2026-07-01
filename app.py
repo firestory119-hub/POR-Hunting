@@ -342,11 +342,18 @@ def get_current_shares_from_fdr(ticker: str) -> float | None:
         if row.empty:
             return None
 
-        for col in ["Stocks", "상장주식수"]:
+        for col in ["Stocks", "상장주식수", "Shares", "ListedShares"]:
             if col in row.columns:
                 val = clean_num(row.iloc[0][col])
                 if val and val > 0:
                     return val
+
+        # 상장주식수 컬럼이 없으면 시총 / 현재가로 역산
+        if "Marcap" in row.columns and "Close" in row.columns:
+            marcap = clean_num(row.iloc[0]["Marcap"])
+            close = clean_num(row.iloc[0]["Close"])
+            if marcap and close and close > 0:
+                return marcap / close    
     except Exception:
         return None
 
