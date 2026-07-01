@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-POR Hunting Pro v28 Stable
+POR Hunting Pro v28.2 Ultra Fast
 - 자동 조회 제거: 버튼을 눌러야 DART/주가 수집 시작
 - DART 요청 timeout 적용
 - API 지연/오류 시 앱이 멈추지 않도록 예외 처리
-- POR/PER/PBR 밴드 + 미래 예상값 계산
+- 초고속 모드: 최초 수집 기간 단축 + 설정 변경 시 재조회 없음
 """
 
 import io
@@ -29,7 +29,7 @@ try:
 except Exception:
     fdr = None
 
-st.set_page_config(page_title="POR Hunting Pro v28", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v28.2", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -41,8 +41,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DART_TIMEOUT = 10
 MARKET_TIMEOUT = 15
 
-st.title("POR Hunting Pro v28")
-st.caption("안정판: 버튼 실행 + DART timeout + 오류 방어 / POR·PER·PBR 밴드")
+st.title("POR Hunting Pro v28.2")
+st.caption("초고속 모드: 처음 수집은 짧게, 이후 설정 변경은 저장 데이터로 즉시 재계산")
 
 
 def clean_num(x):
@@ -545,20 +545,26 @@ with st.sidebar:
 
     st.divider()
     valuation_metric = st.radio("밴드 지표", ["POR", "PER", "PBR"], index=0, horizontal=True)
-    chart_range = st.radio("차트 범위 / 평균 기준", ["1년", "3년", "5년", "10년", "전체"], index=4, horizontal=True)
-    years = st.slider("재무 조회 기간(년)", 5, 10, 10)
+    data_mode = st.radio(
+        "수집 모드",
+        ["초고속(1년)", "빠른(3년)", "정밀(10년)"],
+        index=0,
+        horizontal=True,
+    )
+    chart_range = st.radio("차트 범위 / 평균 기준", ["1년", "3년", "5년", "10년", "전체"], index=0, horizontal=True)
+    years = {"초고속(1년)": 1, "빠른(3년)": 3, "정밀(10년)": 10}[data_mode]
     forward_year = st.number_input("예상연도(E)", value=datetime.today().year, min_value=2020, max_value=2035, step=1)
     expected_base_label = {"POR": "예상 영업이익", "PER": "예상 당기순이익", "PBR": "예상 자본총계"}[valuation_metric]
     forward_base_eok = st.number_input(f"{expected_base_label}(억원, 선택)", value=0.0, step=10.0)
     expected_mcap_eok = st.number_input("예상 시가총액(억원, 선택)", value=0.0, step=50.0)
     expected_price = st.number_input("예상 주가(원, 선택)", value=0.0, step=100.0)
     target_multiple = st.slider(f"목표 {valuation_metric}", 1.0, 30.0, 8.0, 0.5)
-    st.caption("v28: 자동 조회 없음. 버튼을 눌러야 수집합니다.")
+    st.caption("v28.2: 초고속은 최근 1년만 먼저 수집합니다. 10년 차트가 필요하면 정밀(10년)으로 다시 분석하세요.")
 
 
 
 # =========================
-# v28.1 핵심: 검색/분석/차트 재계산 분리
+# v28.2 핵심: 초고속 수집 + 검색/분석/차트 재계산 분리
 # - 종목 검색: DART corpCode만 조회
 # - 분석 시작: DART 재무 + 주가/시총 1회 수집 후 session_state 저장
 # - 이후 POR/PER/PBR, 차트범위, 예상값, 목표배수 변경은 저장 데이터로만 재계산
@@ -673,16 +679,17 @@ if analyze_clicked:
 
     add_history(name, ticker)
 
-    # 분석 데이터는 항상 넉넉히 10년치 수집합니다.
+    # v28.2: 선택한 수집 모드만큼만 가져와 최초 대기 시간을 줄입니다.
     # 이후 차트 범위/지표/예상값 변경은 여기 저장된 데이터로만 즉시 재계산됩니다.
     end_year = datetime.today().year
-    start_year = end_year - 9
+    collect_years = int(years)
+    start_year = end_year - collect_years + 1
     start_date = f"{start_year}0101"
     end_date = datetime.today().strftime("%Y%m%d")
 
     progress = st.progress(0, text="분석 준비 중...")
-    with st.spinner("DART에서 매출액/영업이익/순이익/자본 수집 중..."):
-        progress.progress(25, text="DART 재무 수집 중...")
+    with st.spinner(f"DART 재무 수집 중... ({collect_years}년)"):
+        progress.progress(25, text=f"DART 재무 수집 중... ({collect_years}년)")
         fin_df = fetch_financials(api_key.strip(), corp_code, start_year, end_year)
 
     if fin_df.empty:
@@ -690,8 +697,8 @@ if analyze_clicked:
         st.error("DART 재무 데이터를 가져오지 못했습니다.")
         st.stop()
 
-    with st.spinner("주가/시가총액 수집 중..."):
-        progress.progress(65, text="주가/시가총액 수집 중...")
+    with st.spinner(f"주가/시가총액 수집 중... ({collect_years}년)"):
+        progress.progress(65, text=f"주가/시가총액 수집 중... ({collect_years}년)")
         try:
             mcap_df = fetch_market_cap(ticker, start_date, end_date)
         except Exception as e:
@@ -715,6 +722,8 @@ if analyze_clicked:
     st.session_state["loaded_mcap_df"] = mcap_df
     st.session_state["loaded_current_price"] = current_price_loaded
     st.session_state["loaded_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.session_state["loaded_mode"] = data_mode
+    st.session_state["loaded_collect_years"] = collect_years
 
     progress.progress(100, text="완료")
     progress.empty()
@@ -732,7 +741,9 @@ fin_df = st.session_state["loaded_fin_df"]
 mcap_df = st.session_state["loaded_mcap_df"]
 current_price = st.session_state["loaded_current_price"]
 
-st.caption(f"저장된 데이터 기준: {loaded_name} ({loaded_ticker}) · 수집시각 {st.session_state.get('loaded_at', '-')}")
+st.caption(f"저장된 데이터 기준: {loaded_name} ({loaded_ticker}) · {st.session_state.get('loaded_mode', '-')} · 수집시각 {st.session_state.get('loaded_at', '-')}")
+if st.session_state.get("loaded_collect_years", 10) < 10 and chart_range in ["5년", "10년", "전체"]:
+    st.info("현재 초고속/빠른 모드 데이터만 저장되어 있어 긴 차트 범위는 저장된 기간 내에서만 표시됩니다. 10년 전체 밴드는 수집 모드를 정밀(10년)로 바꾼 뒤 다시 분석하세요.")
 
 fav_now = load_list_csv(FAVORITES_FILE, ["name", "ticker", "saved_at"])
 is_fav = (not fav_now.empty) and (loaded_ticker in fav_now["ticker"].tolist())
