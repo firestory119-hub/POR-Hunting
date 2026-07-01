@@ -24,7 +24,7 @@ except Exception:
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v28", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v26", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -34,36 +34,8 @@ HISTORY_FILE = os.path.join(DATA_DIR, "search_history.csv")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-st.title("POR Hunting Pro v28")
-st.caption("기업 가치평가 플랫폼 · POR/PER/PBR 밴드 · 미래 시뮬레이터 · 모바일 최적화")
-
-
-st.markdown("""
-<style>
-.block-container {padding-top: 1.0rem; padding-bottom: 2rem; max-width: 1500px;}
-[data-testid="stMetric"] {
-    background: rgba(250,250,250,0.78);
-    border: 1px solid rgba(49,51,63,0.12);
-    padding: 0.65rem 0.75rem;
-    border-radius: 0.85rem;
-    min-height: 86px;
-}
-[data-testid="stMetricLabel"] {font-size: 0.82rem; white-space: normal;}
-[data-testid="stMetricValue"] {font-size: 1.15rem; white-space: normal; overflow-wrap: anywhere;}
-[data-testid="stDataFrame"] {border-radius: 0.75rem; overflow: hidden;}
-h1 {letter-spacing: -0.03em;}
-@media (max-width: 768px) {
-    .block-container {padding-left: 0.7rem; padding-right: 0.7rem; padding-top: 0.7rem;}
-    [data-testid="stMetric"] {padding: 0.55rem 0.6rem; min-height: 74px;}
-    [data-testid="stMetricLabel"] {font-size: 0.76rem;}
-    [data-testid="stMetricValue"] {font-size: 0.98rem;}
-    h1 {font-size: 1.55rem !important;}
-    h2 {font-size: 1.25rem !important;}
-    h3 {font-size: 1.08rem !important;}
-}
-</style>
-""", unsafe_allow_html=True)
-
+st.title("POR Hunting Pro v26")
+st.caption("DART 재무 + 주가/시총 + POR/PER/PBR 밴드 + 미래 POR 시뮬레이터")
 
 
 # =========================
@@ -677,7 +649,7 @@ def plot_valuation(val_df: pd.DataFrame, title: str, metric: str, chart_range: s
 
     fig.update_layout(
         title=f"{title} {metric} Band / 범위: {chart_range} / 초록점=미래 예상",
-        height=760,
+        height=650,
         xaxis_title="Date",
         yaxis_title=f"{metric}(배)",
         legend=dict(orientation="h", y=1.08, x=0.75),
