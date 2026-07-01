@@ -29,7 +29,7 @@ try:
 except Exception:
     fdr = None
 
-st.set_page_config(page_title="POR Hunting Pro v28.2", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v29", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -41,8 +41,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DART_TIMEOUT = 10
 MARKET_TIMEOUT = 15
 
-st.title("POR Hunting Pro v28.2")
-st.caption("초고속 모드: 처음 수집은 짧게, 이후 설정 변경은 저장 데이터로 즉시 재계산")
+st.title("POR Hunting Pro v29")
+st.caption("초고속 안정 모드: 시가총액은 pykrx 직접값 우선, 실패 시 보정값으로 계산")
 
 
 def clean_num(x):
@@ -335,49 +335,105 @@ def get_current_shares_from_fdr(ticker: str):
 
 @st.cache_data(show_spinner=False, ttl=60 * 30)
 def fetch_market_cap(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    v29 초고속 안정판
+    1) pykrx의 시가총액 데이터를 직접 사용합니다. 상장주식수 별도 수집을 하지 않습니다.
+    2) pykrx 기간 데이터가 실패하면, pykrx의 최근 시총 1개 + FDR 가격 데이터로 보정 계산합니다.
+    3) 마지막 fallback에서만 FDR 상장주식수를 사용합니다.
+    """
+
+    def normalize_mcap_df(raw: pd.DataFrame) -> pd.DataFrame:
+        if raw is None or raw.empty:
+            return pd.DataFrame()
+        df = raw.copy().reset_index()
+        date_col = df.columns[0]
+        df = df.rename(columns={date_col: "date"})
+        if "시가총액" not in df.columns:
+            return pd.DataFrame()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["market_cap"] = pd.to_numeric(df["시가총액"], errors="coerce")
+        if "종가" in df.columns:
+            df["price"] = pd.to_numeric(df["종가"], errors="coerce")
+        elif "현재가" in df.columns:
+            df["price"] = pd.to_numeric(df["현재가"], errors="coerce")
+        else:
+            df["price"] = None
+        df = df[["date", "market_cap", "price"]].dropna(subset=["date", "market_cap"])
+        df = df[df["market_cap"] > 0]
+        if df.empty:
+            return pd.DataFrame()
+        return df.set_index("date").resample("W-FRI").last().dropna(subset=["market_cap"]).reset_index()
+
+    # 1) pykrx 기간별 시가총액 직접 조회: 제일 정확하고 상장주식수 불필요
     if stock is not None:
-        try:
-            df = stock.get_market_cap_by_date(start_date, end_date, ticker)
-            if df is not None and not df.empty and "시가총액" in df.columns:
-                df = df.reset_index()
-                date_col = df.columns[0]
-                df = df.rename(columns={date_col: "date", "시가총액": "market_cap"})
-                df["date"] = pd.to_datetime(df["date"])
-                df["price"] = df["종가"] if "종가" in df.columns else None
-                df = df[["date", "market_cap", "price"]].dropna(subset=["date", "market_cap"])
-                df = df.set_index("date").resample("W-FRI").last().dropna(subset=["market_cap"]).reset_index()
+        for adj_start in [start_date, f"{start_date[:4]}0101"]:
+            try:
+                raw = stock.get_market_cap_by_date(adj_start, end_date, ticker)
+                df = normalize_mcap_df(raw)
                 if not df.empty:
                     return df
+            except Exception:
+                pass
+
+    # 2) 최근 시총만 pykrx에서 얻고, FDR 가격으로 과거 시총 보정
+    latest_mcap = None
+    latest_price = None
+    if stock is not None:
+        try:
+            cap_by_ticker = stock.get_market_cap_by_ticker(end_date, market="ALL")
+            if cap_by_ticker is not None and not cap_by_ticker.empty:
+                idx = cap_by_ticker.index.astype(str).str.zfill(6)
+                cap_by_ticker = cap_by_ticker.copy()
+                cap_by_ticker.index = idx
+                if ticker in cap_by_ticker.index:
+                    row = cap_by_ticker.loc[ticker]
+                    if "시가총액" in row.index:
+                        latest_mcap = clean_num(row["시가총액"])
+                    if "종가" in row.index:
+                        latest_price = clean_num(row["종가"])
         except Exception:
             pass
 
     if fdr is None:
-        raise RuntimeError("pykrx 조회 실패, FinanceDataReader도 설치되어 있지 않습니다.")
-
-    shares = get_current_shares_from_fdr(ticker)
-    if shares is None or shares <= 0:
-        raise RuntimeError("상장주식수를 가져오지 못했습니다.")
+        raise RuntimeError("시가총액 수집 실패: pykrx 기간 데이터 조회 실패, FinanceDataReader 미설치")
 
     start = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}"
     end = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:]}"
-    price = fdr.DataReader(ticker, start, end)
+    try:
+        price = fdr.DataReader(ticker, start, end)
+    except Exception as e:
+        raise RuntimeError(f"가격 데이터 수집 실패: {e}")
+
     if price is None or price.empty:
-        return pd.DataFrame()
+        raise RuntimeError("가격 데이터가 비어 있습니다.")
 
     price = price.reset_index()
     date_col = price.columns[0]
     price = price.rename(columns={date_col: "date"})
-    close_col = "Close" if "Close" in price.columns else "종가"
-    if close_col not in price.columns:
-        return pd.DataFrame()
+    close_col = "Close" if "Close" in price.columns else ("종가" if "종가" in price.columns else None)
+    if close_col is None:
+        raise RuntimeError("가격 데이터에서 종가 컬럼을 찾지 못했습니다.")
 
-    price["date"] = pd.to_datetime(price["date"])
-    price["price"] = price[close_col].astype(float)
-    price["market_cap"] = price["price"] * float(shares)
+    price["date"] = pd.to_datetime(price["date"], errors="coerce")
+    price["price"] = pd.to_numeric(price[close_col], errors="coerce")
+    price = price[["date", "price"]].dropna()
+    price = price[price["price"] > 0]
+    if price.empty:
+        raise RuntimeError("유효한 가격 데이터가 없습니다.")
+
+    # 최근 시총과 최근 가격으로 유통/발행주식수 비슷한 환산계수 계산
+    if latest_mcap and latest_mcap > 0:
+        if not latest_price or latest_price <= 0:
+            latest_price = float(price["price"].iloc[-1])
+        shares_proxy = float(latest_mcap) / float(latest_price)
+    else:
+        shares_proxy = get_current_shares_from_fdr(ticker)
+        if shares_proxy is None or shares_proxy <= 0:
+            raise RuntimeError("시가총액 수집 실패: pykrx 시총과 FDR 상장주식수 모두 가져오지 못했습니다.")
+
+    price["market_cap"] = price["price"] * float(shares_proxy)
     df = price[["date", "price", "market_cap"]].dropna()
-    df = df.set_index("date").resample("W-FRI").last().dropna().reset_index()
-    return df
-
+    return df.set_index("date").resample("W-FRI").last().dropna().reset_index()
 
 @st.cache_data(show_spinner=False, ttl=60 * 10)
 def get_current_price(ticker: str):
