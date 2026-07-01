@@ -556,91 +556,201 @@ with st.sidebar:
     st.caption("v28: 자동 조회 없음. 버튼을 눌러야 수집합니다.")
 
 
-default_query = "삼성전자"
+
+# =========================
+# v28.1 핵심: 검색/분석/차트 재계산 분리
+# - 종목 검색: DART corpCode만 조회
+# - 분석 시작: DART 재무 + 주가/시총 1회 수집 후 session_state 저장
+# - 이후 POR/PER/PBR, 차트범위, 예상값, 목표배수 변경은 저장 데이터로만 재계산
+# =========================
+
+for k, v in {
+    "found_df": None,
+    "loaded_ticker": None,
+    "loaded_name": None,
+    "loaded_fin_df": None,
+    "loaded_mcap_df": None,
+    "loaded_current_price": None,
+    "loaded_at": None,
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+
+def reset_loaded_data():
+    st.session_state["loaded_ticker"] = None
+    st.session_state["loaded_name"] = None
+    st.session_state["loaded_fin_df"] = None
+    st.session_state["loaded_mcap_df"] = None
+    st.session_state["loaded_current_price"] = None
+    st.session_state["loaded_at"] = None
+
+
+def do_search(api_key_value: str, q_value: str):
+    if not api_key_value:
+        st.warning("왼쪽에 OpenDART API Key를 입력하세요.")
+        return
+    if not q_value.strip():
+        st.warning("종목명을 입력하세요.")
+        return
+
+    with st.spinner("DART 종목 목록을 불러오는 중..."):
+        try:
+            corp = get_corp_codes(api_key_value.strip())
+        except Exception as e:
+            st.error(f"DART 종목 목록 수집 실패: {e}")
+            return
+
+    q = q_value.strip().lower()
+    found = corp[
+        corp["corp_name"].str.lower().str.contains(q, na=False)
+        | corp["stock_code"].astype(str).str.zfill(6).str.contains(q, na=False)
+    ]
+
+    if found.empty:
+        st.error("검색 결과가 없습니다.")
+        st.dataframe(corp.head(20), use_container_width=True)
+        st.session_state["found_df"] = None
+        return
+
+    st.session_state["found_df"] = found.drop_duplicates("stock_code").head(30).copy()
+    reset_loaded_data()
+    st.success(f"검색 완료: {len(st.session_state['found_df'])}개")
+
+
+# 빠른 선택 반영
+if "query_input" not in st.session_state:
+    st.session_state["query_input"] = "삼성전자"
 if selected_quick != "직접 입력":
-    default_query = quick_map.get(selected_quick, "삼성전자")
+    q_from_quick = quick_map.get(selected_quick, "삼성전자")
+    if st.session_state.get("last_quick") != selected_quick:
+        st.session_state["query_input"] = q_from_quick
+        st.session_state["last_quick"] = selected_quick
 
-query = st.text_input("Stock Name", value=default_query)
-run = st.button("데이터 수집 / 차트 생성", type="primary")
+st.markdown("### 1단계: 종목 검색")
+qcol1, qcol2, qcol3 = st.columns([3, 1, 1])
+with qcol1:
+    query = st.text_input("Stock Name", key="query_input")
+with qcol2:
+    search_clicked = st.button("종목 검색", type="secondary", use_container_width=True)
+with qcol3:
+    clear_clicked = st.button("다른 종목", use_container_width=True)
 
-if not run:
-    st.info("종목명을 입력하고 버튼을 누르면 조회를 시작합니다. 이제 앱을 열자마자 DART가 자동 실행되지 않습니다.")
+if clear_clicked:
+    st.session_state["found_df"] = None
+    reset_loaded_data()
+    st.rerun()
+
+if search_clicked:
+    do_search(api_key, st.session_state["query_input"])
+
+found = st.session_state.get("found_df")
+if found is None or found.empty:
+    st.info("종목명을 입력하고 **종목 검색**을 누르세요. 검색만으로는 DART 재무/주가를 수집하지 않습니다.")
     st.stop()
 
-if not api_key:
-    st.warning("왼쪽에 OpenDART API Key를 입력하세요.")
-    st.stop()
-
-if not query.strip():
-    st.warning("종목명을 입력하세요.")
-    st.stop()
-
-with st.spinner("DART 종목 목록을 불러오는 중..."):
-    try:
-        corp = get_corp_codes(api_key.strip())
-    except Exception as e:
-        st.error(f"DART 종목 목록 수집 실패: {e}")
-        st.stop()
-
-q = query.strip().lower()
-found = corp[
-    corp["corp_name"].str.lower().str.contains(q, na=False)
-    | corp["stock_code"].astype(str).str.zfill(6).str.contains(q, na=False)
-]
-
-if found.empty:
-    st.error("검색 결과가 없습니다.")
-    st.dataframe(corp.head(20), use_container_width=True)
-    st.stop()
-
-found = found.drop_duplicates("stock_code").head(30)
-choice_label = st.selectbox("검색 결과", [f"{r.corp_name} ({r.stock_code})" for _, r in found.iterrows()])
+st.markdown("### 2단계: 종목 선택 후 분석 시작")
+choice_label = st.selectbox(
+    "검색 결과",
+    [f"{r.corp_name} ({str(r.stock_code).zfill(6)})" for _, r in found.iterrows()],
+)
 ticker = re.search(r"\((\d{6})\)", choice_label).group(1)
 row = found[found["stock_code"].astype(str).str.zfill(6) == ticker].iloc[0]
 corp_code = row["corp_code"]
 name = row["corp_name"]
-add_history(name, ticker)
+
+acol1, acol2, acol3 = st.columns([1, 1, 4])
+with acol1:
+    analyze_clicked = st.button("선택 종목 분석 시작", type="primary", use_container_width=True)
+with acol2:
+    if st.session_state.get("loaded_ticker"):
+        st.caption(f"현재 로드: {st.session_state['loaded_name']} ({st.session_state['loaded_ticker']})")
+
+if analyze_clicked:
+    if not api_key:
+        st.warning("왼쪽에 OpenDART API Key를 입력하세요.")
+        st.stop()
+
+    add_history(name, ticker)
+
+    # 분석 데이터는 항상 넉넉히 10년치 수집합니다.
+    # 이후 차트 범위/지표/예상값 변경은 여기 저장된 데이터로만 즉시 재계산됩니다.
+    end_year = datetime.today().year
+    start_year = end_year - 9
+    start_date = f"{start_year}0101"
+    end_date = datetime.today().strftime("%Y%m%d")
+
+    progress = st.progress(0, text="분석 준비 중...")
+    with st.spinner("DART에서 매출액/영업이익/순이익/자본 수집 중..."):
+        progress.progress(25, text="DART 재무 수집 중...")
+        fin_df = fetch_financials(api_key.strip(), corp_code, start_year, end_year)
+
+    if fin_df.empty:
+        progress.empty()
+        st.error("DART 재무 데이터를 가져오지 못했습니다.")
+        st.stop()
+
+    with st.spinner("주가/시가총액 수집 중..."):
+        progress.progress(65, text="주가/시가총액 수집 중...")
+        try:
+            mcap_df = fetch_market_cap(ticker, start_date, end_date)
+        except Exception as e:
+            progress.empty()
+            st.error(f"시가총액 수집 실패: {e}")
+            st.stop()
+
+    if mcap_df.empty:
+        progress.empty()
+        st.error("시가총액 데이터를 가져오지 못했습니다.")
+        st.stop()
+
+    progress.progress(90, text="현재가 확인 중...")
+    current_price_loaded = get_current_price(ticker)
+    if not current_price_loaded and not mcap_df.empty and "price" in mcap_df.columns:
+        current_price_loaded = float(mcap_df["price"].dropna().iloc[-1])
+
+    st.session_state["loaded_ticker"] = ticker
+    st.session_state["loaded_name"] = name
+    st.session_state["loaded_fin_df"] = fin_df
+    st.session_state["loaded_mcap_df"] = mcap_df
+    st.session_state["loaded_current_price"] = current_price_loaded
+    st.session_state["loaded_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    progress.progress(100, text="완료")
+    progress.empty()
+    st.success("분석 데이터 저장 완료. 이제 범위/지표/예상값을 바꿔도 DART를 다시 조회하지 않습니다.")
+
+# 아직 분석 시작 전이면 여기서 종료
+if not st.session_state.get("loaded_ticker"):
+    st.info("종목을 선택한 뒤 **선택 종목 분석 시작**을 누르세요.")
+    st.stop()
+
+# 저장된 데이터로만 재계산
+loaded_ticker = st.session_state["loaded_ticker"]
+loaded_name = st.session_state["loaded_name"]
+fin_df = st.session_state["loaded_fin_df"]
+mcap_df = st.session_state["loaded_mcap_df"]
+current_price = st.session_state["loaded_current_price"]
+
+st.caption(f"저장된 데이터 기준: {loaded_name} ({loaded_ticker}) · 수집시각 {st.session_state.get('loaded_at', '-')}")
 
 fav_now = load_list_csv(FAVORITES_FILE, ["name", "ticker", "saved_at"])
-is_fav = (not fav_now.empty) and (ticker in fav_now["ticker"].tolist())
+is_fav = (not fav_now.empty) and (loaded_ticker in fav_now["ticker"].tolist())
 fcol1, fcol2, _ = st.columns([1, 1, 4])
 with fcol1:
     if not is_fav:
-        if st.button("★ 즐겨찾기 추가", key=f"add_fav_{ticker}"):
-            add_favorite(name, ticker)
-            st.success(f"{name} 즐겨찾기 추가")
+        if st.button("★ 즐겨찾기 추가", key=f"add_fav_{loaded_ticker}"):
+            add_favorite(loaded_name, loaded_ticker)
+            st.success(f"{loaded_name} 즐겨찾기 추가")
             st.rerun()
     else:
         st.success("★ 즐겨찾기")
 with fcol2:
     if is_fav:
-        if st.button("☆ 즐겨찾기 해제", key=f"remove_fav_{ticker}"):
-            remove_favorite(ticker)
-            st.info(f"{name} 즐겨찾기 해제")
+        if st.button("☆ 즐겨찾기 해제", key=f"remove_fav_{loaded_ticker}"):
+            remove_favorite(loaded_ticker)
+            st.info(f"{loaded_name} 즐겨찾기 해제")
             st.rerun()
-
-end_year = datetime.today().year
-start_year = end_year - int(years) + 1
-start_date = f"{start_year}0101"
-end_date = datetime.today().strftime("%Y%m%d")
-
-with st.spinner("DART에서 매출액/영업이익/순이익/자본 수집 중..."):
-    fin_df = fetch_financials(api_key.strip(), corp_code, start_year, end_year)
-
-if fin_df.empty:
-    st.error("DART 재무 데이터를 가져오지 못했습니다.")
-    st.stop()
-
-with st.spinner("주가/시가총액 수집 중..."):
-    try:
-        mcap_df = fetch_market_cap(ticker, start_date, end_date)
-    except Exception as e:
-        st.error(f"시가총액 수집 실패: {e}")
-        st.stop()
-
-if mcap_df.empty:
-    st.error("시가총액 데이터를 가져오지 못했습니다.")
-    st.stop()
 
 val_df = make_valuation_df(mcap_df, fin_df, valuation_metric, int(forward_year), forward_base_eok if forward_base_eok > 0 else None)
 if val_df.empty:
@@ -649,7 +759,6 @@ if val_df.empty:
     st.stop()
 
 latest = val_df.iloc[-1]
-current_price = get_current_price(ticker)
 if not current_price and "price" in latest.index and pd.notna(latest["price"]):
     current_price = float(latest["price"])
 
@@ -671,7 +780,7 @@ if forward_base_eok and forward_base_eok > 0:
         "multiple": float(projected_mcap_eok / forward_base_eok),
     }
 
-st.subheader(f"{name} ({ticker})")
+st.subheader(f"{loaded_name} ({loaded_ticker})")
 base_label = {"POR": "영업이익", "PER": "당기순이익", "PBR": "자본총계"}[valuation_metric]
 latest_revenue_df = fin_df.dropna(subset=["revenue"]).tail(1)
 latest_revenue = latest_revenue_df.iloc[0]["revenue"] if not latest_revenue_df.empty else None
@@ -683,7 +792,7 @@ c3.metric("현재 시가총액", f"{latest['market_cap'] / 100_000_000:,.0f}억"
 c4.metric(f"적용 {base_label}", f"{latest['base_value'] / 100_000_000:,.1f}억")
 c5.metric("최근 매출액", f"{latest_revenue / 100_000_000:,.1f}억" if latest_revenue else "-")
 
-fig, mean, std, n_points = plot_valuation(val_df, name, valuation_metric, chart_range, projected_info)
+fig, mean, std, n_points = plot_valuation(val_df, loaded_name, valuation_metric, chart_range, projected_info)
 st.plotly_chart(fig, use_container_width=True)
 
 s1, s2, s3 = st.columns(3)
