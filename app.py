@@ -24,7 +24,7 @@ except Exception:
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v26", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v28", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -34,8 +34,36 @@ HISTORY_FILE = os.path.join(DATA_DIR, "search_history.csv")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-st.title("POR Hunting Pro v26")
-st.caption("DART 재무 + 주가/시총 + POR/PER/PBR 밴드 + 미래 POR 시뮬레이터")
+st.title("POR Hunting Pro v28")
+st.caption("기업 가치평가 플랫폼 · POR/PER/PBR 밴드 · 미래 시뮬레이터 · 모바일 최적화")
+
+
+st.markdown("""
+<style>
+.block-container {padding-top: 1.0rem; padding-bottom: 2rem; max-width: 1500px;}
+[data-testid="stMetric"] {
+    background: rgba(250,250,250,0.78);
+    border: 1px solid rgba(49,51,63,0.12);
+    padding: 0.65rem 0.75rem;
+    border-radius: 0.85rem;
+    min-height: 86px;
+}
+[data-testid="stMetricLabel"] {font-size: 0.82rem; white-space: normal;}
+[data-testid="stMetricValue"] {font-size: 1.15rem; white-space: normal; overflow-wrap: anywhere;}
+[data-testid="stDataFrame"] {border-radius: 0.75rem; overflow: hidden;}
+h1 {letter-spacing: -0.03em;}
+@media (max-width: 768px) {
+    .block-container {padding-left: 0.7rem; padding-right: 0.7rem; padding-top: 0.7rem;}
+    [data-testid="stMetric"] {padding: 0.55rem 0.6rem; min-height: 74px;}
+    [data-testid="stMetricLabel"] {font-size: 0.76rem;}
+    [data-testid="stMetricValue"] {font-size: 0.98rem;}
+    h1 {font-size: 1.55rem !important;}
+    h2 {font-size: 1.25rem !important;}
+    h3 {font-size: 1.08rem !important;}
+}
+</style>
+""", unsafe_allow_html=True)
+
 
 
 # =========================
@@ -342,18 +370,11 @@ def get_current_shares_from_fdr(ticker: str) -> float | None:
         if row.empty:
             return None
 
-        for col in ["Stocks", "상장주식수", "Shares", "ListedShares"]:
+        for col in ["Stocks", "상장주식수"]:
             if col in row.columns:
                 val = clean_num(row.iloc[0][col])
                 if val and val > 0:
                     return val
-
-        # 상장주식수 컬럼이 없으면 시총 / 현재가로 역산
-        if "Marcap" in row.columns and "Close" in row.columns:
-            marcap = clean_num(row.iloc[0]["Marcap"])
-            close = clean_num(row.iloc[0]["Close"])
-            if marcap and close and close > 0:
-                return marcap / close    
     except Exception:
         return None
 
@@ -656,7 +677,7 @@ def plot_valuation(val_df: pd.DataFrame, title: str, metric: str, chart_range: s
 
     fig.update_layout(
         title=f"{title} {metric} Band / 범위: {chart_range} / 초록점=미래 예상",
-        height=650,
+        height=760,
         xaxis_title="Date",
         yaxis_title=f"{metric}(배)",
         legend=dict(orientation="h", y=1.08, x=0.75),
@@ -780,17 +801,6 @@ with st.sidebar:
 # =========================
 # 메인 화면
 # =========================
-# =========================
-# 메인 화면
-# =========================
-# v31: 자동조회 제거 + session_state 저장
-# - 종목명/옵션 변경만으로는 DART·시총을 다시 조회하지 않습니다.
-# - "데이터 수집 / 차트 생성" 버튼을 눌렀을 때만 새 데이터를 수집합니다.
-# - 이후 POR/PER/PBR, 차트 범위, 예상값 변경은 저장된 데이터로 재계산만 합니다.
-
-if "analysis_loaded" not in st.session_state:
-    st.session_state["analysis_loaded"] = False
-
 default_query = "삼성전자"
 try:
     if selected_quick != "직접 입력":
@@ -801,90 +811,52 @@ except Exception:
 query = st.text_input(
     "Stock Name",
     value=default_query,
-    help="종목명을 입력한 뒤 검색 결과를 선택하고, '데이터 수집 / 차트 생성' 버튼을 누르세요."
+    help="종목명을 입력하고 엔터를 누르면 자동으로 조회됩니다."
 )
 
-selected_name = None
-selected_ticker = None
-selected_corp_code = None
+run = bool(query.strip())
 
-if not api_key:
-    st.warning("왼쪽에 OpenDART API Key를 입력하세요. 한 번 입력하면 자동 저장됩니다.")
-else:
-    if query.strip():
-        with st.spinner("DART 종목 목록 확인 중..."):
-            try:
-                corp = get_corp_codes(api_key)
-            except Exception as e:
-                st.error(f"DART 종목 목록 수집 실패: {e}")
-                corp = pd.DataFrame()
+if run:
+    if not api_key:
+        st.warning("왼쪽에 OpenDART API Key를 입력하세요. 한 번 입력하면 자동 저장됩니다.")
+        st.stop()
 
-        if not corp.empty:
-            q = query.strip().lower()
-            found = corp[
-                corp["corp_name"].str.lower().str.contains(q, na=False)
-                | corp["stock_code"].str.contains(q, na=False)
-            ]
+    with st.spinner("DART 종목 목록을 불러오는 중..."):
+        try:
+            corp = get_corp_codes(api_key)
+        except Exception as e:
+            st.error(f"DART 종목 목록 수집 실패: {e}")
+            st.stop()
 
-            if found.empty:
-                st.error("검색 결과가 없습니다.")
-                st.dataframe(corp.head(20))
-            else:
-                found = found.drop_duplicates("stock_code").head(30)
+    if corp.empty:
+        st.error("DART 종목 목록이 비어 있습니다. API Key를 확인하세요.")
+        st.stop()
 
-                choice_label = st.selectbox(
-                    "검색 결과",
-                    [f"{r.corp_name} ({r.stock_code})" for _, r in found.iterrows()],
-                )
+    q = query.strip().lower()
 
-                selected_ticker = re.search(r"\((\d{6})\)", choice_label).group(1)
-                selected_row = found[found["stock_code"] == selected_ticker].iloc[0]
-                selected_corp_code = selected_row["corp_code"]
-                selected_name = selected_row["corp_name"]
+    found = corp[
+        corp["corp_name"].str.lower().str.contains(q, na=False)
+        | corp["stock_code"].str.contains(q, na=False)
+    ]
 
-                run_clicked = st.button("데이터 수집 / 차트 생성", type="primary")
+    if found.empty:
+        st.error("검색 결과가 없습니다.")
+        st.dataframe(corp.head(20))
+        st.stop()
 
-                if run_clicked:
-                    end_year = datetime.today().year
-                    start_year = end_year - years + 1
-                    start_date = f"{start_year}0101"
-                    end_date = datetime.today().strftime("%Y%m%d")
+    found = found.drop_duplicates("stock_code").head(30)
 
-                    add_history(selected_name, selected_ticker)
+    choice_label = st.selectbox(
+        "검색 결과",
+        [f"{r.corp_name} ({r.stock_code})" for _, r in found.iterrows()],
+    )
 
-                    with st.spinner("DART에서 매출액/영업이익/순이익/자본 수집 중..."):
-                        fin_df_new = fetch_financials(api_key, selected_corp_code, start_year, end_year)
+    ticker = re.search(r"\((\d{6})\)", choice_label).group(1)
+    row = found[found["stock_code"] == ticker].iloc[0]
+    corp_code = row["corp_code"]
+    name = row["corp_name"]
 
-                    with st.spinner("주가/시가총액 수집 중..."):
-                        try:
-                            mcap_df_new = fetch_market_cap(selected_ticker, start_date, end_date)
-                        except Exception as e:
-                            st.error(f"시가총액 수집 실패: {e}")
-                            st.stop()
-
-                    if mcap_df_new.empty:
-                        st.error("시가총액 데이터를 가져오지 못했습니다.")
-                        st.stop()
-
-                    st.session_state["analysis_loaded"] = True
-                    st.session_state["analysis_name"] = selected_name
-                    st.session_state["analysis_ticker"] = selected_ticker
-                    st.session_state["analysis_corp_code"] = selected_corp_code
-                    st.session_state["analysis_fin_df"] = fin_df_new
-                    st.session_state["analysis_mcap_df"] = mcap_df_new
-                    st.session_state["analysis_start_year"] = start_year
-                    st.session_state["analysis_end_year"] = end_year
-                    st.success(f"{selected_name} ({selected_ticker}) 데이터 수집 완료")
-
-    else:
-        st.info("종목명을 입력하세요.")
-
-if st.session_state.get("analysis_loaded", False):
-    name = st.session_state["analysis_name"]
-    ticker = st.session_state["analysis_ticker"]
-    corp_code = st.session_state.get("analysis_corp_code")
-    fin_df = st.session_state["analysis_fin_df"]
-    mcap_df = st.session_state["analysis_mcap_df"]
+    add_history(name, ticker)
 
     fav_now = load_list_csv(FAVORITES_FILE, ["name", "ticker", "saved_at"])
     is_fav = (not fav_now.empty) and (ticker in fav_now["ticker"].tolist())
@@ -904,6 +876,25 @@ if st.session_state.get("analysis_loaded", False):
                 remove_favorite(ticker)
                 st.info(f"{name} 즐겨찾기 해제")
                 st.rerun()
+
+    end_year = datetime.today().year
+    start_year = end_year - years + 1
+    start_date = f"{start_year}0101"
+    end_date = datetime.today().strftime("%Y%m%d")
+
+    with st.spinner("DART에서 매출액/영업이익/순이익/자본 수집 중..."):
+        fin_df = fetch_financials(api_key, corp_code, start_year, end_year)
+
+    with st.spinner("주가/시가총액 수집 중..."):
+        try:
+            mcap_df = fetch_market_cap(ticker, start_date, end_date)
+        except Exception as e:
+            st.error(f"시가총액 수집 실패: {e}")
+            st.stop()
+
+    if mcap_df.empty:
+        st.error("시가총액 데이터를 가져오지 못했습니다.")
+        st.stop()
 
     val_df = make_valuation_df(
         mcap_df,
@@ -1314,6 +1305,5 @@ if st.session_state.get("analysis_loaded", False):
             use_container_width=True,
         )
 
-
 else:
-    st.info("종목을 검색한 뒤 '데이터 수집 / 차트 생성' 버튼을 누르세요.")
+    st.info("왼쪽에 DART API Key를 넣고, 종목명을 입력하면 자동으로 조회됩니다.")
