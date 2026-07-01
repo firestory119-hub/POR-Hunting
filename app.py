@@ -10,23 +10,6 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-# v27 modular helper imports
-try:
-    from utils import format_eok, format_price, format_percent
-except Exception:
-    def format_eok(x, decimals=0):
-        return "-" if x is None else f"{x:,.{decimals}f}억"
-    def format_price(x):
-        return "-" if x is None else f"{x:,.0f}원"
-    def format_percent(x):
-        return "-" if x is None else f"{x:,.1f}%"
-
-try:
-    from report import make_ai_style_summary
-except Exception:
-    make_ai_style_summary = None
-
-
 try:
     from pykrx import stock
 except Exception:
@@ -41,7 +24,7 @@ except Exception:
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v27", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v26", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -51,7 +34,7 @@ HISTORY_FILE = os.path.join(DATA_DIR, "search_history.csv")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-st.title("POR Hunting Pro v27")
+st.title("POR Hunting Pro v26")
 st.caption("DART 재무 + 주가/시총 + POR/PER/PBR 밴드 + 미래 POR 시뮬레이터")
 
 
