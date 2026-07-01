@@ -29,7 +29,7 @@ try:
 except Exception:
     fdr = None
 
-st.set_page_config(page_title="POR Hunting Pro v29", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v30", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -41,8 +41,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DART_TIMEOUT = 10
 MARKET_TIMEOUT = 15
 
-st.title("POR Hunting Pro v29")
-st.caption("초고속 안정 모드: 시가총액은 pykrx 직접값 우선, 실패 시 보정값으로 계산")
+st.title("POR Hunting Pro v30")
+st.caption("v27 재무수집 로직 유지 + 초고속 안정 모드: 최초 1회만 수집, 이후 즉시 재계산")
 
 
 def clean_num(x):
@@ -615,12 +615,12 @@ with st.sidebar:
     expected_mcap_eok = st.number_input("예상 시가총액(억원, 선택)", value=0.0, step=50.0)
     expected_price = st.number_input("예상 주가(원, 선택)", value=0.0, step=100.0)
     target_multiple = st.slider(f"목표 {valuation_metric}", 1.0, 30.0, 8.0, 0.5)
-    st.caption("v28.2: 초고속은 최근 1년만 먼저 수집합니다. 10년 차트가 필요하면 정밀(10년)으로 다시 분석하세요.")
+    st.caption("v30: 초고속은 최근 주가/시총만 짧게 수집하고, DART 재무는 최신 확정 사업연도 기준으로 조회합니다.")
 
 
 
 # =========================
-# v28.2 핵심: 초고속 수집 + 검색/분석/차트 재계산 분리
+# v30 핵심: v27 DART 재무수집 유지 + 검색/분석/차트 재계산 분리
 # - 종목 검색: DART corpCode만 조회
 # - 분석 시작: DART 재무 + 주가/시총 1회 수집 후 session_state 저장
 # - 이후 POR/PER/PBR, 차트범위, 예상값, 목표배수 변경은 저장 데이터로만 재계산
@@ -735,18 +735,22 @@ if analyze_clicked:
 
     add_history(name, ticker)
 
-    # v28.2: 선택한 수집 모드만큼만 가져와 최초 대기 시간을 줄입니다.
-    # 이후 차트 범위/지표/예상값 변경은 여기 저장된 데이터로만 즉시 재계산됩니다.
-    end_year = datetime.today().year
+    # v30: DART 연간 재무는 최신 확정 사업연도까지만 조회합니다.
+    # 예: 2026년에는 2026년 사업보고서가 없으므로 2025년까지 조회해야 None 문제가 안 납니다.
     collect_years = int(years)
-    start_year = end_year - collect_years + 1
-    start_date = f"{start_year}0101"
-    end_date = datetime.today().strftime("%Y%m%d")
+    today = datetime.today()
+    fin_end_year = today.year - 1
+    fin_start_year = fin_end_year - collect_years + 1
+
+    # 주가/시총은 현재까지 조회합니다. 초고속 모드에서는 최근 1년만 가져옵니다.
+    market_start_year = today.year - collect_years + 1
+    start_date = f"{market_start_year}0101"
+    end_date = today.strftime("%Y%m%d")
 
     progress = st.progress(0, text="분석 준비 중...")
-    with st.spinner(f"DART 재무 수집 중... ({collect_years}년)"):
-        progress.progress(25, text=f"DART 재무 수집 중... ({collect_years}년)")
-        fin_df = fetch_financials(api_key.strip(), corp_code, start_year, end_year)
+    with st.spinner(f"DART 재무 수집 중... ({fin_start_year}~{fin_end_year})"):
+        progress.progress(25, text=f"DART 재무 수집 중... ({fin_start_year}~{fin_end_year})")
+        fin_df = fetch_financials(api_key.strip(), corp_code, fin_start_year, fin_end_year)
 
     if fin_df.empty:
         progress.empty()
