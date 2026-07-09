@@ -3,4 +3,5 @@ pandas
 plotly
 requests
 finance-datareader
+FinanceDataReader
 pykrx
