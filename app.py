@@ -37,7 +37,7 @@ MARKET_DATA_CSV = os.path.join(DATA_DIR, "market_data.csv")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 st.title("POR Hunting Pro v30 Preserve")
-st.caption("DART 재무 + 주가/시총 + POR/PER/PBR 밴드 + 미래 POR 시뮬레이터")
+st.caption("CSV 재무 + 주가/시총 + POR/PER/PBR 밴드 + 미래 POR 시뮬레이터")
 
 
 # =========================
@@ -671,11 +671,11 @@ if run:
         try:
             corp = get_corp_codes(api_key)
         except Exception as e:
-            st.error(f"DART 종목 목록 수집 실패: {e}")
+            st.error(f"종목 목록 읽기 실패: {e}")
             st.stop()
 
     if corp.empty:
-        st.error("DART 종목 목록이 비어 있습니다. API Key를 확인하세요.")
+        st.error("종목 목록이 비어 있습니다. data/market_data.csv를 확인하세요.")
         st.stop()
 
     q = query.strip().lower()
@@ -723,7 +723,7 @@ if run:
                 st.info(f"{name} 즐겨찾기 해제")
                 st.rerun()
 
-    end_year = datetime.today().year
+    end_year = datetime.today().year - 1
     start_year = end_year - years + 1
     start_date = f"{start_year}0101"
     end_date = datetime.today().strftime("%Y%m%d")
@@ -1156,4 +1156,4 @@ if run:
         )
 
 else:
-    st.info("왼쪽에 DART API Key를 넣고, 종목명을 입력하면 자동으로 조회됩니다.")
+    st.info("종목명을 입력하면 저장된 CSV 데이터로 조회됩니다.")
