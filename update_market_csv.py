@@ -197,61 +197,112 @@ def request_json(url, params):
         return {}
 
 
+
 def fetch_year(corp_code, year):
+    """
+    주요계정 API를 연도당 1회만 호출합니다.
+    응답 안에서 연결(CFS)을 우선 선택하고, 없으면 별도(OFS)를 사용합니다.
+    """
+    data = request_json(
+        "https://opendart.fss.or.kr/api/fnlttSinglAcnt.json",
+        {
+            "crtfc_key": DART_API_KEY,
+            "corp_code": corp_code,
+            "bsns_year": str(year),
+            "reprt_code": "11011",
+        },
+    )
+
+    if data.get("status") != "000":
+        return None, None, None, None
+
+    items = data.get("list", [])
+
+    cfs_items = [x for x in items if str(x.get("fs_div", "")).strip() == "CFS"]
+    ofs_items = [x for x in items if str(x.get("fs_div", "")).strip() == "OFS"]
+
     revenue = operating = net_income = equity = None
 
-    for fs_div in ("CFS", "OFS"):
-        data = request_json(
-            "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json",
-            {
-                "crtfc_key": DART_API_KEY,
-                "corp_code": corp_code,
-                "bsns_year": str(year),
-                "reprt_code": "11011",
-                "fs_div": fs_div,
-            },
-        )
-        if data.get("status") != "000":
-            continue
+    if cfs_items:
+        revenue, operating, net_income, equity = pick_accounts(cfs_items, "CFS")
 
-        r, o, n, e = pick_accounts(data.get("list", []), fs_div)
+    if not (revenue and operating and net_income and equity) and ofs_items:
+        r, o, n, e = pick_accounts(ofs_items, "OFS")
         revenue = revenue or r
         operating = operating or o
         net_income = net_income or n
         equity = equity or e
 
-        if revenue and operating and net_income and equity:
-            break
-
-    if not (revenue and operating and net_income and equity):
-        data = request_json(
-            "https://opendart.fss.or.kr/api/fnlttSinglAcnt.json",
-            {
-                "crtfc_key": DART_API_KEY,
-                "corp_code": corp_code,
-                "bsns_year": str(year),
-                "reprt_code": "11011",
-            },
-        )
-        if data.get("status") == "000":
-            r, o, n, e = pick_accounts(data.get("list", []), "FALLBACK")
-            revenue = revenue or r
-            operating = operating or o
-            net_income = net_income or n
-            equity = equity or e
-
     return revenue, operating, net_income, equity
+
+
+def load_financial_targets(market_df):
+    """
+    전체 2,800여 종목을 매번 조회하지 않고 실제 사용 종목만 수집합니다.
+
+    대상 우선순위:
+    1) 기존 data/financial_data.csv에 들어 있는 종목
+    2) data/favorites.csv
+    3) data/search_history.csv
+    """
+    targets = []
+
+    if os.path.exists(FINANCIAL_FILE):
+        try:
+            old = pd.read_csv(FINANCIAL_FILE, dtype=str)
+            if {"ticker", "name"}.issubset(old.columns):
+                targets.append(old[["ticker", "name"]])
+        except Exception:
+            pass
+
+    for path, ticker_col, name_col in [
+        (os.path.join(DATA_DIR, "favorites.csv"), "ticker", "name"),
+        (os.path.join(DATA_DIR, "search_history.csv"), "ticker", "name"),
+    ]:
+        if os.path.exists(path):
+            try:
+                df = pd.read_csv(path, dtype=str)
+                if {ticker_col, name_col}.issubset(df.columns):
+                    part = df[[ticker_col, name_col]].copy()
+                    part.columns = ["ticker", "name"]
+                    targets.append(part)
+            except Exception:
+                pass
+
+    if targets:
+        result = pd.concat(targets, ignore_index=True)
+        result["ticker"] = result["ticker"].map(clean_ticker)
+        result["name"] = result["name"].astype(str).str.strip()
+        result = result.dropna().drop_duplicates("ticker")
+    else:
+        result = pd.DataFrame(columns=["ticker", "name"])
+
+    # 이름이나 코드가 오래됐을 수 있으므로 최신 market_data.csv로 보정
+    latest = market_df[["종목코드", "종목명"]].copy()
+    latest.columns = ["ticker", "latest_name"]
+    latest["ticker"] = latest["ticker"].map(clean_ticker)
+
+    if not result.empty:
+        result = result.merge(latest, on="ticker", how="left")
+        result["name"] = result["latest_name"].fillna(result["name"])
+        result = result[["ticker", "name"]]
+
+    return result.drop_duplicates("ticker").reset_index(drop=True)
 
 
 def build_financial_csv(market_df):
     print("[3/3] financial_data.csv 생성")
 
-    corp = get_corp_codes()
-    stocks = market_df[["종목코드", "종목명"]].copy()
-    stocks.columns = ["ticker", "name"]
-    stocks["ticker"] = stocks["ticker"].map(clean_ticker)
+    targets = load_financial_targets(market_df)
+    if targets.empty:
+        raise RuntimeError(
+            "재무 수집 대상이 없습니다. 앱에서 종목을 한 번 검색하거나 즐겨찾기에 추가한 뒤 다시 실행하세요."
+        )
 
-    merged = stocks.merge(
+    print(f"재무 수집 대상: {len(targets):,}개 종목")
+
+    corp = get_corp_codes()
+    merged = targets.merge(
         corp[["ticker", "corp_code"]],
         on="ticker",
         how="left",
@@ -266,9 +317,10 @@ def build_financial_csv(market_df):
         name = row["name"]
         corp_code = row.get("corp_code")
 
-        print(f"[{idx + 1}/{len(merged)}] {name} ({ticker})")
+        print(f"[{idx + 1}/{len(merged)}] {name} ({ticker})", flush=True)
 
         if pd.isna(corp_code):
+            print("  - DART 종목코드 없음, 건너뜀", flush=True)
             continue
 
         for year in range(start_year, end_year + 1):
@@ -287,7 +339,11 @@ def build_financial_csv(market_df):
                 "operating_income": op,
                 "net_income": net,
                 "equity": eq,
-                "operating_margin": (op / rev * 100) if rev not in (None, 0) and op is not None else None,
+                "operating_margin": (
+                    op / rev * 100
+                    if rev not in (None, 0) and op is not None
+                    else None
+                ),
                 "revenue_account_nm": revenue[0] if revenue else None,
                 "op_account_nm": operating[0] if operating else None,
                 "net_account_nm": net_income[0] if net_income else None,
@@ -299,11 +355,18 @@ def build_financial_csv(market_df):
                     equity[3] if equity else None
                 ),
             })
-            time.sleep(0.05)
 
-    pd.DataFrame(rows).to_csv(FINANCIAL_FILE, index=False, encoding="utf-8-sig")
-    print(f"financial_data.csv 완료: {len(rows):,}행")
+            time.sleep(0.03)
 
+    if not rows:
+        raise RuntimeError("DART 재무 데이터를 한 건도 수집하지 못했습니다.")
+
+    pd.DataFrame(rows).to_csv(
+        FINANCIAL_FILE,
+        index=False,
+        encoding="utf-8-sig",
+    )
+    print(f"financial_data.csv 완료: {len(rows):,}행", flush=True)
 
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
