@@ -24,7 +24,7 @@ except Exception:
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v26", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v26.1", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -34,7 +34,12 @@ HISTORY_FILE = os.path.join(DATA_DIR, "search_history.csv")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-st.title("POR Hunting Pro v26")
+# 외부 API가 늦거나 일시적으로 실패해도 오래 멈추지 않도록 설정
+HTTP = requests.Session()
+HTTP.headers.update({"User-Agent": "Mozilla/5.0 POR-Hunting-Pro/1.0"})
+
+
+st.title("POR Hunting Pro v26.1")
 st.caption("DART 재무 + 주가/시총 + POR/PER/PBR 밴드 + 미래 POR 시뮬레이터")
 
 
@@ -113,7 +118,8 @@ def get_corp_codes(api_key: str) -> pd.DataFrame:
             return df
 
     url = "https://opendart.fss.or.kr/api/corpCode.xml"
-    r = requests.get(url, params={"crtfc_key": api_key}, timeout=60)
+    r = HTTP.get(url, params={"crtfc_key": api_key}, timeout=(5, 15))
+    r.raise_for_status()
 
     try:
         z = zipfile.ZipFile(io.BytesIO(r.content))
@@ -139,19 +145,39 @@ def get_corp_codes(api_key: str) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
 def fetch_financials(api_key: str, corp_code: str, start_year: int, end_year: int) -> pd.DataFrame:
     """
-    DART에서 매출액/영업이익/당기순이익/자본총계를 수집합니다.
-    연결(CFS) 우선, 별도(OFS) fallback.
+    DART 사업보고서 재무를 수집합니다.
+    - 아직 사업보고서가 없는 현재 연도는 조회하지 않음
+    - 요청별 최대 대기시간을 짧게 제한
+    - 연결(CFS) 우선, 없으면 별도(OFS)
+    - 한 연도에서 필요한 값이 확보되면 즉시 다음 연도로 이동
     """
     rows = []
 
+    # 현재 연도의 사업보고서(11011)는 보통 아직 없으므로 전년도까지만 조회
+    last_completed_year = datetime.today().year - 1
+    end_year = min(int(end_year), last_completed_year)
+
+    if start_year > end_year:
+        return pd.DataFrame(columns=[
+            "year", "revenue", "operating_income", "net_income", "equity",
+            "operating_margin", "revenue_account_nm", "op_account_nm",
+            "net_account_nm", "equity_account_nm", "fs_div"
+        ])
+
+    def first_number(it):
+        # 0도 유효한 값이므로 or 연산을 사용하지 않음
+        for key in ("thstrm_amount", "thstrm_add_amount", "frmtrm_amount"):
+            value = clean_num(it.get(key))
+            if value is not None:
+                return value
+        return None
+
     def pick_accounts(items, fs_div_label):
-        revenue_candidates = []
-        op_candidates = []
-        net_candidates = []
-        equity_candidates = []
+        revenue_candidates, op_candidates = [], []
+        net_candidates, equity_candidates = [], []
 
         for it in items:
             acc = str(it.get("account_nm", "")).strip()
@@ -160,42 +186,32 @@ def fetch_financials(api_key: str, corp_code: str, start_year: int, end_year: in
 
             acc_norm = acc.replace(" ", "").replace("\n", "")
             acc_id_norm = acc_id.lower()
-
-            val = (
-                clean_num(it.get("thstrm_amount"))
-                or clean_num(it.get("thstrm_add_amount"))
-                or clean_num(it.get("frmtrm_amount"))
-            )
+            val = first_number(it)
             if val is None:
                 continue
 
-            is_income_stmt = (not sj) or sj in ["IS", "CIS"]
-            is_balance_sheet = (not sj) or sj in ["BS"]
+            is_income_stmt = (not sj) or sj in ("IS", "CIS")
+            is_balance_sheet = (not sj) or sj == "BS"
 
             if is_income_stmt:
                 is_revenue = (
-                    acc_norm in ["매출액", "수익(매출액)", "영업수익"]
+                    acc_norm in ("매출액", "수익(매출액)", "영업수익")
                     or "매출액" in acc_norm
                     or "수익(매출액)" in acc_norm
                     or "revenue" in acc_id_norm
                     or "sales" in acc_id_norm
                 )
-
                 is_operating_income = (
                     "영업이익" in acc_norm
-                    or "영업이익(손실)" in acc_norm
                     or "operatingincome" in acc_id_norm
                     or "operatingprofit" in acc_id_norm
                     or "profitlossfromoperatingactivities" in acc_id_norm
                 )
-
                 is_net_income = (
-                    acc_norm in ["당기순이익", "당기순이익(손실)", "분기순이익", "분기순이익(손실)"]
+                    acc_norm in ("당기순이익", "당기순이익(손실)", "분기순이익", "분기순이익(손실)")
                     or "당기순이익" in acc_norm
-                    or acc_id_norm == "ifrs-full_profitloss"
-                    or acc_id_norm == "profitloss"
+                    or acc_id_norm in ("ifrs-full_profitloss", "profitloss")
                     or "profitlossattributabletoownersofparent" in acc_id_norm
-                    or "profitloss" in acc_id_norm
                 )
 
                 if is_revenue:
@@ -207,17 +223,18 @@ def fetch_financials(api_key: str, corp_code: str, start_year: int, end_year: in
 
             if is_balance_sheet:
                 is_equity = (
-                    acc_norm in ["자본총계", "자본"]
+                    acc_norm in ("자본총계", "자본")
                     or "자본총계" in acc_norm
-                    or acc_id_norm in ["ifrs-full_equity", "ifrs-full_equityattributabletoownersofparent"]
-                    or "equity" in acc_id_norm
+                    or acc_id_norm in (
+                        "ifrs-full_equity",
+                        "ifrs-full_equityattributabletoownersofparent",
+                    )
                 )
-
                 if is_equity:
                     equity_candidates.append((acc, acc_id, val, fs_div_label))
 
         def pick_short(candidates):
-            return sorted(candidates, key=lambda x: (len(x[0]), x[0]))[0] if candidates else None
+            return min(candidates, key=lambda x: (len(x[0]), x[0])) if candidates else None
 
         revenue = pick_short(revenue_candidates)
         operating = pick_short(op_candidates)
@@ -230,70 +247,59 @@ def fetch_financials(api_key: str, corp_code: str, start_year: int, end_year: in
 
         return revenue, operating, net_income, equity
 
-    for year in range(start_year, end_year + 1):
-        revenue_found = None
-        op_found = None
-        net_found = None
-        equity_found = None
+    def request_json(url, params):
+        try:
+            response = HTTP.get(url, params=params, timeout=(4, 8))
+            response.raise_for_status()
+            return response.json()
+        except (requests.RequestException, ValueError):
+            return {}
 
-        for fs_div in ["CFS", "OFS"]:
-            url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
-            params = {
-                "crtfc_key": api_key,
-                "corp_code": corp_code,
-                "bsns_year": str(year),
-                "reprt_code": "11011",
-                "fs_div": fs_div,
-            }
+    for year in range(int(start_year), int(end_year) + 1):
+        revenue_found = op_found = net_found = equity_found = None
 
-            try:
-                r = requests.get(url, params=params, timeout=25)
-                data = r.json()
-            except Exception:
-                continue
-
+        # 연결 우선. 연결자료가 정상적으로 있으면 별도 재호출을 하지 않음.
+        for fs_div in ("CFS", "OFS"):
+            data = request_json(
+                "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json",
+                {
+                    "crtfc_key": api_key,
+                    "corp_code": corp_code,
+                    "bsns_year": str(year),
+                    "reprt_code": "11011",
+                    "fs_div": fs_div,
+                },
+            )
             if data.get("status") != "000":
                 continue
 
             rev, op, net, equity = pick_accounts(data.get("list", []), fs_div)
+            revenue_found = revenue_found or rev
+            op_found = op_found or op
+            net_found = net_found or net
+            equity_found = equity_found or equity
 
-            if revenue_found is None and rev:
-                revenue_found = rev
-            if op_found is None and op:
-                op_found = op
-            if net_found is None and net:
-                net_found = net
-            if equity_found is None and equity:
-                equity_found = equity
-
+            # 정상 연결재무가 있으면 대체로 충분하므로 즉시 종료
             if revenue_found and op_found and net_found and equity_found:
                 break
 
-        # 주요 계정 API fallback
+        # 일부 계정만 빠졌을 때만 주요계정 API를 1회 호출
         if not (revenue_found and op_found and net_found and equity_found):
-            url = "https://opendart.fss.or.kr/api/fnlttSinglAcnt.json"
-            params = {
-                "crtfc_key": api_key,
-                "corp_code": corp_code,
-                "bsns_year": str(year),
-                "reprt_code": "11011",
-            }
-
-            try:
-                r = requests.get(url, params=params, timeout=25)
-                data = r.json()
-                if data.get("status") == "000":
-                    rev, op, net, equity = pick_accounts(data.get("list", []), "FALLBACK")
-                    if revenue_found is None and rev:
-                        revenue_found = rev
-                    if op_found is None and op:
-                        op_found = op
-                    if net_found is None and net:
-                        net_found = net
-                    if equity_found is None and equity:
-                        equity_found = equity
-            except Exception:
-                pass
+            data = request_json(
+                "https://opendart.fss.or.kr/api/fnlttSinglAcnt.json",
+                {
+                    "crtfc_key": api_key,
+                    "corp_code": corp_code,
+                    "bsns_year": str(year),
+                    "reprt_code": "11011",
+                },
+            )
+            if data.get("status") == "000":
+                rev, op, net, equity = pick_accounts(data.get("list", []), "FALLBACK")
+                revenue_found = revenue_found or rev
+                op_found = op_found or op
+                net_found = net_found or net
+                equity_found = equity_found or equity
 
         revenue = revenue_found[2] if revenue_found else None
         operating_income = op_found[2] if op_found else None
@@ -301,32 +307,27 @@ def fetch_financials(api_key: str, corp_code: str, start_year: int, end_year: in
         equity = equity_found[2] if equity_found else None
 
         margin = None
-        if revenue and operating_income:
+        if revenue not in (None, 0) and operating_income is not None:
             margin = operating_income / revenue * 100
 
-        rows.append(
-            {
-                "year": year,
-                "revenue": revenue,
-                "operating_income": operating_income,
-                "net_income": net_income,
-                "equity": equity,
-                "operating_margin": margin,
-                "revenue_account_nm": revenue_found[0] if revenue_found else None,
-                "op_account_nm": op_found[0] if op_found else None,
-                "net_account_nm": net_found[0] if net_found else None,
-                "equity_account_nm": equity_found[0] if equity_found else None,
-                "fs_div": (
-                    op_found[3]
-                    if op_found
-                    else (
-                        revenue_found[3]
-                        if revenue_found
-                        else (net_found[3] if net_found else (equity_found[3] if equity_found else None))
-                    )
-                ),
-            }
-        )
+        rows.append({
+            "year": year,
+            "revenue": revenue,
+            "operating_income": operating_income,
+            "net_income": net_income,
+            "equity": equity,
+            "operating_margin": margin,
+            "revenue_account_nm": revenue_found[0] if revenue_found else None,
+            "op_account_nm": op_found[0] if op_found else None,
+            "net_account_nm": net_found[0] if net_found else None,
+            "equity_account_nm": equity_found[0] if equity_found else None,
+            "fs_div": (
+                op_found[3] if op_found else
+                revenue_found[3] if revenue_found else
+                net_found[3] if net_found else
+                equity_found[3] if equity_found else None
+            ),
+        })
 
     return pd.DataFrame(rows)
 
@@ -849,7 +850,7 @@ if run:
                 st.info(f"{name} 즐겨찾기 해제")
                 st.rerun()
 
-    end_year = datetime.today().year
+    end_year = datetime.today().year - 1  # 완료된 사업보고서 기준
     start_year = end_year - years + 1
     start_date = f"{start_year}0101"
     end_date = datetime.today().strftime("%Y%m%d")
