@@ -24,22 +24,19 @@ except Exception:
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v26.1", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v30 Preserve", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
 API_KEY_FILE = os.path.join(DATA_DIR, "dart_api_key.txt")
 FAVORITES_FILE = os.path.join(DATA_DIR, "favorites.csv")
 HISTORY_FILE = os.path.join(DATA_DIR, "search_history.csv")
+FINANCIAL_CSV = os.path.join(DATA_DIR, "financial_data.csv")
+MARKET_DATA_CSV = os.path.join(DATA_DIR, "market_data.csv")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# 외부 API가 늦거나 일시적으로 실패해도 오래 멈추지 않도록 설정
-HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "Mozilla/5.0 POR-Hunting-Pro/1.0"})
-
-
-st.title("POR Hunting Pro v26.1")
+st.title("POR Hunting Pro v30 Preserve")
 st.caption("DART 재무 + 주가/시총 + POR/PER/PBR 밴드 + 미래 POR 시뮬레이터")
 
 
@@ -110,226 +107,106 @@ def add_history(name: str, ticker: str):
 # =========================
 # 데이터 수집 함수
 # =========================
-@st.cache_data(show_spinner=False)
-def get_corp_codes(api_key: str) -> pd.DataFrame:
-    if os.path.exists(CORP_CACHE):
-        df = pd.read_csv(CORP_CACHE, dtype={"corp_code": str, "stock_code": str})
-        if not df.empty:
-            return df
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def get_corp_codes(api_key: str = "") -> pd.DataFrame:
+    """
+    로컬 CSV에서 종목 목록을 구성합니다.
+    앱 조회 중에는 DART 종목코드 API를 호출하지 않습니다.
+    """
+    frames = []
 
-    url = "https://opendart.fss.or.kr/api/corpCode.xml"
-    r = HTTP.get(url, params={"crtfc_key": api_key}, timeout=(5, 15))
-    r.raise_for_status()
+    if os.path.exists(FINANCIAL_CSV):
+        try:
+            fin = pd.read_csv(FINANCIAL_CSV, dtype={"ticker": str})
+            if not fin.empty and {"name", "ticker"}.issubset(fin.columns):
+                tmp = fin[["name", "ticker"]].dropna().drop_duplicates()
+                frames.append(tmp)
+        except Exception:
+            pass
+
+    if os.path.exists(MARKET_DATA_CSV):
+        try:
+            market = pd.read_csv(MARKET_DATA_CSV, dtype=str)
+            name_col = "name" if "name" in market.columns else ("종목명" if "종목명" in market.columns else None)
+            ticker_col = "ticker" if "ticker" in market.columns else ("종목코드" if "종목코드" in market.columns else None)
+            if name_col and ticker_col:
+                tmp = market[[name_col, ticker_col]].copy()
+                tmp.columns = ["name", "ticker"]
+                frames.append(tmp)
+        except Exception:
+            pass
+
+    if not frames:
+        raise RuntimeError(
+            "종목 목록 CSV가 없습니다. data/financial_data.csv 또는 "
+            "data/market_data.csv를 먼저 생성하세요."
+        )
+
+    df = pd.concat(frames, ignore_index=True).dropna().drop_duplicates("ticker")
+    df["ticker"] = (
+        df["ticker"].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(6)
+    )
+    df["name"] = df["name"].astype(str).str.strip()
+
+    return df.rename(columns={
+        "name": "corp_name",
+        "ticker": "stock_code",
+    }).assign(corp_code="")
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def fetch_financials(ticker: str, start_year: int, end_year: int) -> pd.DataFrame:
+    """
+    data/financial_data.csv에서 재무 데이터를 읽습니다.
+    앱 조회 중에는 DART 재무 API를 호출하지 않습니다.
+    """
+    required = [
+        "year", "revenue", "operating_income", "net_income", "equity",
+        "operating_margin", "revenue_account_nm", "op_account_nm",
+        "net_account_nm", "equity_account_nm", "fs_div",
+    ]
+
+    if not os.path.exists(FINANCIAL_CSV):
+        raise RuntimeError(
+            "data/financial_data.csv가 없습니다. "
+            "GitHub Actions의 Update financial data를 먼저 실행하세요."
+        )
 
     try:
-        z = zipfile.ZipFile(io.BytesIO(r.content))
-    except Exception:
-        txt = r.text[:300]
-        raise RuntimeError(f"DART 응답 오류. API Key를 확인하세요. 응답: {txt}")
+        df = pd.read_csv(FINANCIAL_CSV, dtype={"ticker": str})
+    except Exception as e:
+        raise RuntimeError(f"financial_data.csv 읽기 실패: {e}") from e
 
-    xml_data = z.read(z.namelist()[0])
-    root = ET.fromstring(xml_data)
+    if df.empty:
+        raise RuntimeError(
+            "financial_data.csv가 비어 있습니다. "
+            "GitHub Actions의 Update financial data를 먼저 실행하세요."
+        )
 
-    rows = []
-    for item in root.findall("list"):
-        corp_code = item.findtext("corp_code", "")
-        corp_name = item.findtext("corp_name", "")
-        stock_code = item.findtext("stock_code", "").strip()
-        modify_date = item.findtext("modify_date", "")
+    if "ticker" not in df.columns:
+        raise RuntimeError("financial_data.csv에 ticker 열이 없습니다.")
 
-        if len(stock_code) == 6:
-            rows.append([corp_code, corp_name, stock_code, modify_date])
+    df["ticker"] = (
+        df["ticker"].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(6)
+    )
+    df["year"] = pd.to_numeric(df["year"], errors="coerce")
 
-    df = pd.DataFrame(rows, columns=["corp_code", "corp_name", "stock_code", "modify_date"])
-    df.to_csv(CORP_CACHE, index=False, encoding="utf-8-sig")
-    return df
+    for col in ["revenue", "operating_income", "net_income", "equity", "operating_margin"]:
+        if col not in df.columns:
+            df[col] = None
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    for col in required:
+        if col not in df.columns:
+            df[col] = None
 
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
-def fetch_financials(api_key: str, corp_code: str, start_year: int, end_year: int) -> pd.DataFrame:
-    """
-    DART 사업보고서 재무를 수집합니다.
-    - 아직 사업보고서가 없는 현재 연도는 조회하지 않음
-    - 요청별 최대 대기시간을 짧게 제한
-    - 연결(CFS) 우선, 없으면 별도(OFS)
-    - 한 연도에서 필요한 값이 확보되면 즉시 다음 연도로 이동
-    """
-    rows = []
+    out = df[
+        (df["ticker"] == str(ticker).zfill(6))
+        & (df["year"] >= int(start_year))
+        & (df["year"] <= int(end_year))
+    ][required].copy()
 
-    # 현재 연도의 사업보고서(11011)는 보통 아직 없으므로 전년도까지만 조회
-    last_completed_year = datetime.today().year - 1
-    end_year = min(int(end_year), last_completed_year)
-
-    if start_year > end_year:
-        return pd.DataFrame(columns=[
-            "year", "revenue", "operating_income", "net_income", "equity",
-            "operating_margin", "revenue_account_nm", "op_account_nm",
-            "net_account_nm", "equity_account_nm", "fs_div"
-        ])
-
-    def first_number(it):
-        # 0도 유효한 값이므로 or 연산을 사용하지 않음
-        for key in ("thstrm_amount", "thstrm_add_amount", "frmtrm_amount"):
-            value = clean_num(it.get(key))
-            if value is not None:
-                return value
-        return None
-
-    def pick_accounts(items, fs_div_label):
-        revenue_candidates, op_candidates = [], []
-        net_candidates, equity_candidates = [], []
-
-        for it in items:
-            acc = str(it.get("account_nm", "")).strip()
-            acc_id = str(it.get("account_id", "")).strip()
-            sj = str(it.get("sj_div", "")).strip()
-
-            acc_norm = acc.replace(" ", "").replace("\n", "")
-            acc_id_norm = acc_id.lower()
-            val = first_number(it)
-            if val is None:
-                continue
-
-            is_income_stmt = (not sj) or sj in ("IS", "CIS")
-            is_balance_sheet = (not sj) or sj == "BS"
-
-            if is_income_stmt:
-                is_revenue = (
-                    acc_norm in ("매출액", "수익(매출액)", "영업수익")
-                    or "매출액" in acc_norm
-                    or "수익(매출액)" in acc_norm
-                    or "revenue" in acc_id_norm
-                    or "sales" in acc_id_norm
-                )
-                is_operating_income = (
-                    "영업이익" in acc_norm
-                    or "operatingincome" in acc_id_norm
-                    or "operatingprofit" in acc_id_norm
-                    or "profitlossfromoperatingactivities" in acc_id_norm
-                )
-                is_net_income = (
-                    acc_norm in ("당기순이익", "당기순이익(손실)", "분기순이익", "분기순이익(손실)")
-                    or "당기순이익" in acc_norm
-                    or acc_id_norm in ("ifrs-full_profitloss", "profitloss")
-                    or "profitlossattributabletoownersofparent" in acc_id_norm
-                )
-
-                if is_revenue:
-                    revenue_candidates.append((acc, acc_id, val, fs_div_label))
-                if is_operating_income:
-                    op_candidates.append((acc, acc_id, val, fs_div_label))
-                if is_net_income:
-                    net_candidates.append((acc, acc_id, val, fs_div_label))
-
-            if is_balance_sheet:
-                is_equity = (
-                    acc_norm in ("자본총계", "자본")
-                    or "자본총계" in acc_norm
-                    or acc_id_norm in (
-                        "ifrs-full_equity",
-                        "ifrs-full_equityattributabletoownersofparent",
-                    )
-                )
-                if is_equity:
-                    equity_candidates.append((acc, acc_id, val, fs_div_label))
-
-        def pick_short(candidates):
-            return min(candidates, key=lambda x: (len(x[0]), x[0])) if candidates else None
-
-        revenue = pick_short(revenue_candidates)
-        operating = pick_short(op_candidates)
-        net_income = pick_short(net_candidates)
-
-        equity = None
-        if equity_candidates:
-            exact = [x for x in equity_candidates if x[0].replace(" ", "") == "자본총계"]
-            equity = exact[0] if exact else pick_short(equity_candidates)
-
-        return revenue, operating, net_income, equity
-
-    def request_json(url, params):
-        try:
-            response = HTTP.get(url, params=params, timeout=(4, 8))
-            response.raise_for_status()
-            return response.json()
-        except (requests.RequestException, ValueError):
-            return {}
-
-    for year in range(int(start_year), int(end_year) + 1):
-        revenue_found = op_found = net_found = equity_found = None
-
-        # 연결 우선. 연결자료가 정상적으로 있으면 별도 재호출을 하지 않음.
-        for fs_div in ("CFS", "OFS"):
-            data = request_json(
-                "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json",
-                {
-                    "crtfc_key": api_key,
-                    "corp_code": corp_code,
-                    "bsns_year": str(year),
-                    "reprt_code": "11011",
-                    "fs_div": fs_div,
-                },
-            )
-            if data.get("status") != "000":
-                continue
-
-            rev, op, net, equity = pick_accounts(data.get("list", []), fs_div)
-            revenue_found = revenue_found or rev
-            op_found = op_found or op
-            net_found = net_found or net
-            equity_found = equity_found or equity
-
-            # 정상 연결재무가 있으면 대체로 충분하므로 즉시 종료
-            if revenue_found and op_found and net_found and equity_found:
-                break
-
-        # 일부 계정만 빠졌을 때만 주요계정 API를 1회 호출
-        if not (revenue_found and op_found and net_found and equity_found):
-            data = request_json(
-                "https://opendart.fss.or.kr/api/fnlttSinglAcnt.json",
-                {
-                    "crtfc_key": api_key,
-                    "corp_code": corp_code,
-                    "bsns_year": str(year),
-                    "reprt_code": "11011",
-                },
-            )
-            if data.get("status") == "000":
-                rev, op, net, equity = pick_accounts(data.get("list", []), "FALLBACK")
-                revenue_found = revenue_found or rev
-                op_found = op_found or op
-                net_found = net_found or net
-                equity_found = equity_found or equity
-
-        revenue = revenue_found[2] if revenue_found else None
-        operating_income = op_found[2] if op_found else None
-        net_income = net_found[2] if net_found else None
-        equity = equity_found[2] if equity_found else None
-
-        margin = None
-        if revenue not in (None, 0) and operating_income is not None:
-            margin = operating_income / revenue * 100
-
-        rows.append({
-            "year": year,
-            "revenue": revenue,
-            "operating_income": operating_income,
-            "net_income": net_income,
-            "equity": equity,
-            "operating_margin": margin,
-            "revenue_account_nm": revenue_found[0] if revenue_found else None,
-            "op_account_nm": op_found[0] if op_found else None,
-            "net_account_nm": net_found[0] if net_found else None,
-            "equity_account_nm": equity_found[0] if equity_found else None,
-            "fs_div": (
-                op_found[3] if op_found else
-                revenue_found[3] if revenue_found else
-                net_found[3] if net_found else
-                equity_found[3] if equity_found else None
-            ),
-        })
-
-    return pd.DataFrame(rows)
+    return out.sort_values("year").reset_index(drop=True)
 
 
 @st.cache_data(show_spinner=False)
@@ -684,7 +561,7 @@ with st.sidebar:
             saved_key = ""
 
     api_key = st.text_input(
-        "OpenDART API Key",
+        "OpenDART API Key (자동수집용, 앱 조회에는 불필요)",
         value=saved_key,
         type="password"
     )
@@ -768,7 +645,7 @@ with st.sidebar:
     bull_por = st.number_input("낙관 POR", value=12.0, step=0.5)
     target_multiple_manual = st.number_input("목표 배수 직접입력(선택)", value=0.0, step=0.5)
 
-    st.caption("v25: 미래 POR, 적정가, 텐베거, 간단 리포트까지 한 번에 확인합니다.")
+    st.caption("v30 Preserve: 기존 기능 유지 + 재무 CSV 초고속 모드")
 
 
 # =========================
@@ -790,11 +667,7 @@ query = st.text_input(
 run = bool(query.strip())
 
 if run:
-    if not api_key:
-        st.warning("왼쪽에 OpenDART API Key를 입력하세요. 한 번 입력하면 자동 저장됩니다.")
-        st.stop()
-
-    with st.spinner("DART 종목 목록을 불러오는 중..."):
+    with st.spinner("저장된 종목 목록을 불러오는 중..."):
         try:
             corp = get_corp_codes(api_key)
         except Exception as e:
@@ -850,13 +723,17 @@ if run:
                 st.info(f"{name} 즐겨찾기 해제")
                 st.rerun()
 
-    end_year = datetime.today().year - 1  # 완료된 사업보고서 기준
+    end_year = datetime.today().year
     start_year = end_year - years + 1
     start_date = f"{start_year}0101"
     end_date = datetime.today().strftime("%Y%m%d")
 
-    with st.spinner("DART에서 매출액/영업이익/순이익/자본 수집 중..."):
-        fin_df = fetch_financials(api_key, corp_code, start_year, end_year)
+    with st.spinner("저장된 재무 데이터를 불러오는 중..."):
+        try:
+            fin_df = fetch_financials(ticker, start_year, end_year)
+        except Exception as e:
+            st.error(f"재무 데이터 읽기 실패: {e}")
+            st.stop()
 
     with st.spinner("주가/시가총액 수집 중..."):
         try:
