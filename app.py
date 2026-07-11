@@ -10,10 +10,6 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-try:
-    from pykrx import stock
-except Exception:
-    stock = None
 
 try:
     import FinanceDataReader as fdr
@@ -24,7 +20,7 @@ except Exception:
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v30 Preserve", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v30 Stable", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -36,8 +32,8 @@ MARKET_DATA_CSV = os.path.join(DATA_DIR, "market_data.csv")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-st.title("POR Hunting Pro v30 Preserve")
-st.caption("CSV 재무 + 주가/시총 + POR/PER/PBR 밴드 + 미래 POR 시뮬레이터")
+st.title("POR Hunting Pro v30 Stable")
+st.caption("CSV 재무 + FinanceDataReader 주가 + POR/PER/PBR 밴드")
 
 
 # =========================
@@ -209,98 +205,75 @@ def fetch_financials(ticker: str, start_year: int, end_year: int) -> pd.DataFram
     return out.sort_values("year").reset_index(drop=True)
 
 
-@st.cache_data(show_spinner=False)
-def get_current_shares_from_fdr(ticker: str) -> float | None:
-    if fdr is None:
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def get_current_shares_from_csv(ticker: str) -> float | None:
+    if not os.path.exists(MARKET_DATA_CSV):
         return None
-
     try:
-        listing = fdr.StockListing("KRX")
-        row = listing[listing["Code"].astype(str).str.zfill(6) == ticker]
-        if row.empty:
-            return None
-
-        for col in ["Stocks", "상장주식수"]:
-            if col in row.columns:
-                val = clean_num(row.iloc[0][col])
-                if val and val > 0:
-                    return val
+        df = pd.read_csv(MARKET_DATA_CSV, dtype=str)
     except Exception:
         return None
+    code_col = "종목코드" if "종목코드" in df.columns else ("ticker" if "ticker" in df.columns else None)
+    shares_col = "상장주식수" if "상장주식수" in df.columns else ("Stocks" if "Stocks" in df.columns else None)
+    if not code_col or not shares_col:
+        return None
+    df[code_col] = df[code_col].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(6)
+    row = df[df[code_col] == str(ticker).zfill(6)]
+    if row.empty:
+        return None
+    value = clean_num(row.iloc[0][shares_col])
+    return value if value and value > 0 else None
 
-    return None
 
-
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=60 * 60)
 def fetch_market_cap(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """
-    1순위: pykrx 시가총액 직접 조회
-    2순위: FinanceDataReader 주가 × 현재 상장주식수
-    """
-    # 1순위 pykrx
-    if stock is not None:
-        try:
-            df = stock.get_market_cap_by_date(start_date, end_date, ticker)
-            if df is not None and not df.empty and "시가총액" in df.columns:
-                df = df.reset_index()
-                date_col = df.columns[0]
-                df = df.rename(columns={date_col: "date", "시가총액": "market_cap"})
-                df["date"] = pd.to_datetime(df["date"])
-
-                if "종가" in df.columns:
-                    df["price"] = df["종가"]
-                else:
-                    df["price"] = None
-
-                df = df[["date", "market_cap", "price"]].dropna(subset=["date", "market_cap"])
-                df = df.set_index("date").resample("W-FRI").last().dropna(subset=["market_cap"]).reset_index()
-                if not df.empty:
-                    return df
-        except Exception:
-            pass
-
-    # 2순위 FinanceDataReader
     if fdr is None:
-        raise RuntimeError("pykrx 시가총액 조회 실패. FinanceDataReader도 설치되어 있지 않습니다.")
-
-    shares = get_current_shares_from_fdr(ticker)
+        raise RuntimeError("FinanceDataReader가 설치되어 있지 않습니다.")
+    shares = get_current_shares_from_csv(ticker)
     if shares is None or shares <= 0:
-        raise RuntimeError("상장주식수를 가져오지 못했습니다. FinanceDataReader 설치/조회 상태를 확인하세요.")
-
+        raise RuntimeError("market_data.csv에서 상장주식수를 찾지 못했습니다.")
     start = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}"
     end = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:]}"
-
     price = fdr.DataReader(ticker, start, end)
     if price is None or price.empty:
         return pd.DataFrame()
-
     price = price.reset_index()
     date_col = price.columns[0]
     price = price.rename(columns={date_col: "date"})
-
     close_col = "Close" if "Close" in price.columns else "종가"
     if close_col not in price.columns:
         return pd.DataFrame()
-
-    price["date"] = pd.to_datetime(price["date"])
-    price["price"] = price[close_col].astype(float)
+    price["date"] = pd.to_datetime(price["date"], errors="coerce")
+    price["price"] = pd.to_numeric(price[close_col], errors="coerce")
     price["market_cap"] = price["price"] * float(shares)
-
     df = price[["date", "price", "market_cap"]].dropna()
-    df = df.set_index("date").resample("W-FRI").last().dropna().reset_index()
-
-    return df
+    return df.set_index("date").resample("W-FRI").last().dropna().reset_index()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=60 * 30)
 def get_current_price(ticker: str):
+    if os.path.exists(MARKET_DATA_CSV):
+        try:
+            df = pd.read_csv(MARKET_DATA_CSV, dtype=str)
+            code_col = "종목코드" if "종목코드" in df.columns else ("ticker" if "ticker" in df.columns else None)
+            price_col = "현재가" if "현재가" in df.columns else ("price" if "price" in df.columns else None)
+            if code_col and price_col:
+                df[code_col] = df[code_col].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(6)
+                row = df[df[code_col] == str(ticker).zfill(6)]
+                if not row.empty:
+                    value = clean_num(row.iloc[0][price_col])
+                    if value and value > 0:
+                        return value
+        except Exception:
+            pass
     if fdr is not None:
         try:
-            df = fdr.DataReader(ticker)
+            start = (pd.Timestamp.today() - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+            df = fdr.DataReader(ticker, start)
             if df is not None and not df.empty:
                 close_col = "Close" if "Close" in df.columns else "종가"
                 if close_col in df.columns:
-                    return float(df[close_col].dropna().iloc[-1])
+                    return float(pd.to_numeric(df[close_col], errors="coerce").dropna().iloc[-1])
         except Exception:
             pass
     return None
@@ -671,11 +644,11 @@ if run:
         try:
             corp = get_corp_codes(api_key)
         except Exception as e:
-            st.error(f"종목 목록 읽기 실패: {e}")
+            st.error(f"DART 종목 목록 수집 실패: {e}")
             st.stop()
 
     if corp.empty:
-        st.error("종목 목록이 비어 있습니다. data/market_data.csv를 확인하세요.")
+        st.error("DART 종목 목록이 비어 있습니다. API Key를 확인하세요.")
         st.stop()
 
     q = query.strip().lower()
@@ -723,7 +696,7 @@ if run:
                 st.info(f"{name} 즐겨찾기 해제")
                 st.rerun()
 
-    end_year = datetime.today().year - 1
+    end_year = datetime.today().year
     start_year = end_year - years + 1
     start_date = f"{start_year}0101"
     end_date = datetime.today().strftime("%Y%m%d")
@@ -1156,4 +1129,4 @@ if run:
         )
 
 else:
-    st.info("종목명을 입력하면 저장된 CSV 데이터로 조회됩니다.")
+    st.info("왼쪽에 DART API Key를 넣고, 종목명을 입력하면 자동으로 조회됩니다.")
