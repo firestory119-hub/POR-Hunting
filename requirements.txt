@@ -1,7 +1,3 @@
-streamlit
-pandas
-plotly
-requests
-finance-datareader
-Finance-DataReader
-pykrx
+streamlit==1.59.1
+pandas==2.2.3
+plotly==5.24.1
