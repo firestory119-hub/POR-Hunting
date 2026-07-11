@@ -33,7 +33,7 @@ MARKET_DATA_CSV = os.path.join(DATA_DIR, "market_data.csv")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 st.title("POR Hunting Pro v30 Stable")
-st.caption("CSV 재무 + FinanceDataReader 주가 + POR/PER/PBR 밴드")
+st.caption("CSV 재무 + CSV 현재가 + FinanceDataReader 과거주가")
 
 
 # =========================
@@ -205,60 +205,87 @@ def fetch_financials(ticker: str, start_year: int, end_year: int) -> pd.DataFram
     return out.sort_values("year").reset_index(drop=True)
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60)
+@st.cache_data(show_spinner=False, ttl=3600)
 def get_current_shares_from_csv(ticker: str) -> float | None:
     if not os.path.exists(MARKET_DATA_CSV):
         return None
+
     try:
         df = pd.read_csv(MARKET_DATA_CSV, dtype=str)
     except Exception:
         return None
+
     code_col = "종목코드" if "종목코드" in df.columns else ("ticker" if "ticker" in df.columns else None)
     shares_col = "상장주식수" if "상장주식수" in df.columns else ("Stocks" if "Stocks" in df.columns else None)
+
     if not code_col or not shares_col:
         return None
-    df[code_col] = df[code_col].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(6)
+
+    df[code_col] = (
+        df[code_col].astype(str)
+        .str.replace(r"\.0$", "", regex=True)
+        .str.zfill(6)
+    )
     row = df[df[code_col] == str(ticker).zfill(6)]
     if row.empty:
         return None
+
     value = clean_num(row.iloc[0][shares_col])
     return value if value and value > 0 else None
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60)
+@st.cache_data(show_spinner=False, ttl=3600)
 def fetch_market_cap(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
     if fdr is None:
         raise RuntimeError("FinanceDataReader가 설치되어 있지 않습니다.")
+
     shares = get_current_shares_from_csv(ticker)
     if shares is None or shares <= 0:
         raise RuntimeError("market_data.csv에서 상장주식수를 찾지 못했습니다.")
+
     start = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}"
     end = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:]}"
+
     price = fdr.DataReader(ticker, start, end)
     if price is None or price.empty:
         return pd.DataFrame()
+
     price = price.reset_index()
     date_col = price.columns[0]
     price = price.rename(columns={date_col: "date"})
+
     close_col = "Close" if "Close" in price.columns else "종가"
     if close_col not in price.columns:
         return pd.DataFrame()
+
     price["date"] = pd.to_datetime(price["date"], errors="coerce")
     price["price"] = pd.to_numeric(price[close_col], errors="coerce")
     price["market_cap"] = price["price"] * float(shares)
+
     df = price[["date", "price", "market_cap"]].dropna()
-    return df.set_index("date").resample("W-FRI").last().dropna().reset_index()
+    return (
+        df.set_index("date")
+        .resample("W-FRI")
+        .last()
+        .dropna()
+        .reset_index()
+    )
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 30)
+@st.cache_data(show_spinner=False, ttl=1800)
 def get_current_price(ticker: str):
     if os.path.exists(MARKET_DATA_CSV):
         try:
             df = pd.read_csv(MARKET_DATA_CSV, dtype=str)
             code_col = "종목코드" if "종목코드" in df.columns else ("ticker" if "ticker" in df.columns else None)
             price_col = "현재가" if "현재가" in df.columns else ("price" if "price" in df.columns else None)
+
             if code_col and price_col:
-                df[code_col] = df[code_col].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(6)
+                df[code_col] = (
+                    df[code_col].astype(str)
+                    .str.replace(r"\.0$", "", regex=True)
+                    .str.zfill(6)
+                )
                 row = df[df[code_col] == str(ticker).zfill(6)]
                 if not row.empty:
                     value = clean_num(row.iloc[0][price_col])
@@ -266,16 +293,7 @@ def get_current_price(ticker: str):
                         return value
         except Exception:
             pass
-    if fdr is not None:
-        try:
-            start = (pd.Timestamp.today() - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
-            df = fdr.DataReader(ticker, start)
-            if df is not None and not df.empty:
-                close_col = "Close" if "Close" in df.columns else "종가"
-                if close_col in df.columns:
-                    return float(pd.to_numeric(df[close_col], errors="coerce").dropna().iloc[-1])
-        except Exception:
-            pass
+
     return None
 
 
