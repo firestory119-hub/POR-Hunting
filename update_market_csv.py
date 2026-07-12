@@ -5,7 +5,6 @@ import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
-import FinanceDataReader as fdr
 import pandas as pd
 import requests
 
@@ -42,45 +41,18 @@ def clean_ticker(value):
 
 
 def build_market_csv():
-    print("[1/3] market_data.csv 생성")
-    df = fdr.StockListing("KRX")
-    if df is None or df.empty:
-        raise RuntimeError("KRX 종목 목록 조회 실패")
+    print("[1/2] 기존 market_data.csv 읽기", flush=True)
 
-    df["Code"] = df["Code"].astype(str).str.zfill(6)
-    df = df.rename(columns={
-        "Code": "종목코드",
-        "Name": "종목명",
-        "Close": "현재가",
-        "Marcap": "시가총액",
-        "Stocks": "상장주식수",
-        "PER": "PER",
-        "PBR": "PBR",
-        "DIV": "배당수익률",
-        "EPS": "EPS",
-        "BPS": "BPS",
-        "DPS": "DPS",
-    })
+    if not os.path.exists(MARKET_FILE):
+        raise RuntimeError("data/market_data.csv가 없습니다.")
 
-    df["기준일"] = datetime.today().strftime("%Y-%m-%d")
-    if "시가총액" in df.columns:
-        df["현재시총_억원"] = (
-            pd.to_numeric(df["시가총액"], errors="coerce") / 100_000_000
-        ).round(0)
+    df = pd.read_csv(MARKET_FILE, dtype=str)
 
-    cols = [
-        "기준일", "종목코드", "종목명", "현재가", "현재시총_억원",
-        "PER", "PBR", "배당수익률", "EPS", "BPS", "DPS", "상장주식수",
-    ]
-    df = df[[c for c in cols if c in df.columns]].copy()
+    if "종목코드" not in df.columns or "종목명" not in df.columns:
+        raise RuntimeError("market_data.csv에 종목코드/종목명 열이 없습니다.")
+
     df["종목코드"] = df["종목코드"].map(clean_ticker)
-
-    if "현재가" in df.columns:
-        df = df[pd.to_numeric(df["현재가"], errors="coerce").fillna(0) > 0]
-
-    df = df.drop_duplicates("종목코드").sort_values("종목코드").reset_index(drop=True)
-    df.to_csv(MARKET_FILE, index=False, encoding="utf-8-sig")
-    print(f"market_data.csv 완료: {len(df):,}개")
+    print(f"market_data.csv 확인 완료: {len(df):,}개", flush=True)
     return df
 
 
@@ -100,7 +72,7 @@ def get_corp_codes():
         except Exception:
             pass
 
-    print("[2/3] DART 종목코드 다운로드")
+    print("[DART] 종목코드 다운로드", flush=True)
     r = HTTP.get(
         "https://opendart.fss.or.kr/api/corpCode.xml",
         params={"crtfc_key": DART_API_KEY},
@@ -303,7 +275,7 @@ def build_financial_csv(market_df):
             time.sleep(0.05)
 
     pd.DataFrame(rows).to_csv(FINANCIAL_FILE, index=False, encoding="utf-8-sig")
-    print(f"financial_data.csv 완료: {len(rows):,}행")
+    print(f"financial_data.csv 완료: {len(rows):,}행", flush=True)
 
 
 
@@ -442,11 +414,15 @@ def build_quarterly_financial_csv(market_df):
     print(f"financial_quarterly.csv 완료: {len(rows):,}행", flush=True)
 
 def main():
+    print("=== 분기 재무 업데이트 시작 ===", flush=True)
     os.makedirs(DATA_DIR, exist_ok=True)
+
     market_df = build_market_csv()
-    build_financial_csv(market_df)
+
+    print("[2/2] 분기 재무 생성 시작", flush=True)
     build_quarterly_financial_csv(market_df)
-    print("전체 업데이트 완료")
+
+    print("=== 분기 재무 업데이트 완료 ===", flush=True)
 
 
 if __name__ == "__main__":
