@@ -1,3 +1,4 @@
+
 import io
 import os
 import time
@@ -11,21 +12,21 @@ import requests
 DATA_DIR = "data"
 MARKET_FILE = os.path.join(DATA_DIR, "market_data.csv")
 FINANCIAL_FILE = os.path.join(DATA_DIR, "financial_data.csv")
-QUARTERLY_FILE = os.path.join(DATA_DIR, "financial_quarterly.csv")
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
+QUARTERLY_FILE = os.path.join(DATA_DIR, "financial_quarterly.csv")
 
-DART_API_KEY = os.environ.get("DART_API_KEY", "").strip()
+DART_API_KEY = os.getenv("DART_API_KEY", "").strip()
 YEARS = 10
 
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "Mozilla/5.0 POR-Hunting-Updater/1.0"})
+HTTP.headers.update({"User-Agent": "Mozilla/5.0 POR-Hunting-Quarterly/1.0"})
 
 
 def clean_num(value):
     if value is None:
         return None
     s = str(value).replace(",", "").replace(" ", "").strip()
-    if s in ("", "-", "nan", "None"):
+    if s in {"", "-", "nan", "None"}:
         return None
     try:
         return float(s)
@@ -34,145 +35,162 @@ def clean_num(value):
 
 
 def clean_ticker(value):
-    s = str(value).strip()
-    if s.endswith(".0"):
-        s = s[:-2]
-    return s.zfill(6)
+    if value is None:
+        return None
+    s = str(value).strip().replace(".0", "")
+    digits = "".join(ch for ch in s if ch.isdigit())
+    return digits.zfill(6) if digits else None
 
 
-def build_market_csv():
-    print("[1/2] 기존 market_data.csv 읽기", flush=True)
-
-    if not os.path.exists(MARKET_FILE):
-        raise RuntimeError("data/market_data.csv가 없습니다.")
-
-    df = pd.read_csv(MARKET_FILE, dtype=str)
-
-    if "종목코드" not in df.columns or "종목명" not in df.columns:
-        raise RuntimeError("market_data.csv에 종목코드/종목명 열이 없습니다.")
-
-    df["종목코드"] = df["종목코드"].map(clean_ticker)
-    print(f"market_data.csv 확인 완료: {len(df):,}개", flush=True)
-    return df
+def request_json(url, params, retries=3):
+    for attempt in range(retries):
+        try:
+            response = HTTP.get(url, params=params, timeout=(5, 20))
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:
+            if attempt == retries - 1:
+                print(f"API 오류: {exc}", flush=True)
+                return {}
+            time.sleep(1.5 * (attempt + 1))
+    return {}
 
 
 def get_corp_codes():
-    if not DART_API_KEY:
-        raise RuntimeError("GitHub Secret DART_API_KEY가 없습니다.")
+    print("[1/4] DART 종목코드 준비", flush=True)
 
     if os.path.exists(CORP_CACHE):
         try:
-            df = pd.read_csv(CORP_CACHE, dtype=str).rename(columns={
-                "corp_name": "name",
-                "stock_code": "ticker",
-            })
-            if {"corp_code", "name", "ticker"}.issubset(df.columns):
-                df["ticker"] = df["ticker"].map(clean_ticker)
-                return df[["corp_code", "name", "ticker"]].drop_duplicates("ticker")
+            cached = pd.read_csv(CORP_CACHE, dtype=str)
+            required = {"corp_code", "stock_code"}
+            if required.issubset(cached.columns) and not cached.empty:
+                cached["stock_code"] = cached["stock_code"].map(clean_ticker)
+                print(f"corp_codes.csv 사용: {len(cached):,}개", flush=True)
+                return cached
         except Exception:
             pass
 
-    print("[DART] 종목코드 다운로드", flush=True)
-    r = HTTP.get(
+    if not DART_API_KEY:
+        raise RuntimeError("GitHub Secret DART_API_KEY가 없습니다.")
+
+    response = HTTP.get(
         "https://opendart.fss.or.kr/api/corpCode.xml",
         params={"crtfc_key": DART_API_KEY},
-        timeout=(10, 60),
+        timeout=(5, 30),
     )
-    r.raise_for_status()
+    response.raise_for_status()
 
-    z = zipfile.ZipFile(io.BytesIO(r.content))
-    root = ET.fromstring(z.read(z.namelist()[0]))
+    with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
+        xml_data = zf.read(zf.namelist()[0])
 
+    root = ET.fromstring(xml_data)
     rows = []
     for item in root.findall("list"):
-        ticker = item.findtext("stock_code", "").strip()
-        if len(ticker) == 6:
+        stock_code = clean_ticker(item.findtext("stock_code", ""))
+        if stock_code:
             rows.append({
                 "corp_code": item.findtext("corp_code", ""),
-                "name": item.findtext("corp_name", ""),
-                "ticker": ticker,
+                "corp_name": item.findtext("corp_name", ""),
+                "stock_code": stock_code,
+                "modify_date": item.findtext("modify_date", ""),
             })
 
-    df = pd.DataFrame(rows)
-    df["ticker"] = df["ticker"].map(clean_ticker)
-    df.to_csv(CORP_CACHE, index=False, encoding="utf-8-sig")
-    return df
+    corp = pd.DataFrame(rows)
+    corp.to_csv(CORP_CACHE, index=False, encoding="utf-8-sig")
+    print(f"corp_codes.csv 생성: {len(corp):,}개", flush=True)
+    return corp
 
 
-def first_value(item):
+def load_targets():
+    print("[2/4] 수집 대상 준비", flush=True)
+    targets = []
+
+    if os.path.exists(FINANCIAL_FILE):
+        try:
+            df = pd.read_csv(FINANCIAL_FILE, dtype=str)
+            if {"ticker", "name"}.issubset(df.columns):
+                targets.append(df[["ticker", "name"]])
+        except Exception:
+            pass
+
+    for filename in ["favorites.csv", "search_history.csv"]:
+        path = os.path.join(DATA_DIR, filename)
+        if os.path.exists(path):
+            try:
+                df = pd.read_csv(path, dtype=str)
+                if {"ticker", "name"}.issubset(df.columns):
+                    targets.append(df[["ticker", "name"]])
+            except Exception:
+                pass
+
+    if not targets:
+        raise RuntimeError("분기 재무 수집 대상이 없습니다.")
+
+    result = pd.concat(targets, ignore_index=True)
+    result["ticker"] = result["ticker"].map(clean_ticker)
+    result["name"] = result["name"].astype(str).str.strip()
+    result = result.dropna(subset=["ticker"]).drop_duplicates("ticker")
+
+    print(f"수집 대상: {len(result):,}개 종목", flush=True)
+    return result.reset_index(drop=True)
+
+
+def first_number(item):
     for key in ("thstrm_amount", "thstrm_add_amount", "frmtrm_amount"):
-        v = clean_num(item.get(key))
-        if v is not None:
-            return v
+        value = clean_num(item.get(key))
+        if value is not None:
+            return value
     return None
 
 
-def pick_accounts(items, fs_div):
-    rev, op, net, eq = [], [], [], []
+def pick_accounts(items, fs_div_label):
+    revenue_candidates = []
+    operating_candidates = []
+    net_candidates = []
+    equity_candidates = []
 
-    for it in items:
-        acc = str(it.get("account_nm", "")).strip()
-        acc_id = str(it.get("account_id", "")).lower().strip()
-        sj = str(it.get("sj_div", "")).strip()
-        acc_norm = acc.replace(" ", "").replace("\n", "")
-        val = first_value(it)
-        if val is None:
+    for item in items:
+        account_name = str(item.get("account_nm", "")).strip()
+        account_id = str(item.get("account_id", "")).strip().lower()
+        statement = str(item.get("sj_div", "")).strip()
+        norm = account_name.replace(" ", "").replace("\n", "")
+        value = first_number(item)
+        if value is None:
             continue
 
-        if (not sj) or sj in ("IS", "CIS"):
-            if (
-                acc_norm in ("매출액", "수익(매출액)", "영업수익", "매출")
-                or "매출액" in acc_norm
-                or "revenue" in acc_id
-                or "sales" in acc_id
-            ):
-                rev.append((acc, acc_id, val, fs_div))
+        is_income = not statement or statement in {"IS", "CIS"}
+        is_balance = not statement or statement == "BS"
 
-            if (
-                "영업이익" in acc_norm
-                or "operatingincome" in acc_id
-                or "operatingprofit" in acc_id
-                or "profitlossfromoperatingactivities" in acc_id
-            ):
-                op.append((acc, acc_id, val, fs_div))
+        if is_income:
+            if norm in {"매출액", "수익(매출액)", "영업수익"} or "매출액" in norm or "revenue" in account_id or "sales" in account_id:
+                revenue_candidates.append((account_name, account_id, value, fs_div_label))
+            if "영업이익" in norm or "operatingincome" in account_id or "operatingprofit" in account_id or "profitlossfromoperatingactivities" in account_id:
+                operating_candidates.append((account_name, account_id, value, fs_div_label))
+            if "당기순이익" in norm or "분기순이익" in norm or account_id in {"ifrs-full_profitloss", "profitloss"} or "profitlossattributabletoownersofparent" in account_id:
+                net_candidates.append((account_name, account_id, value, fs_div_label))
 
-            if (
-                "당기순이익" in acc_norm
-                or acc_id in ("ifrs-full_profitloss", "profitloss")
-                or "profitlossattributabletoownersofparent" in acc_id
-            ):
-                net.append((acc, acc_id, val, fs_div))
+        if is_balance:
+            if norm in {"자본총계", "자본"} or "자본총계" in norm or account_id in {"ifrs-full_equity", "ifrs-full_equityattributabletoownersofparent"}:
+                equity_candidates.append((account_name, account_id, value, fs_div_label))
 
-        if (not sj) or sj == "BS":
-            if (
-                acc_norm in ("자본총계", "자본")
-                or "자본총계" in acc_norm
-                or acc_id in (
-                    "ifrs-full_equity",
-                    "ifrs-full_equityattributabletoownersofparent",
-                )
-            ):
-                eq.append((acc, acc_id, val, fs_div))
+    def choose(candidates, exact_name=None):
+        if not candidates:
+            return None
+        if exact_name:
+            exact = [x for x in candidates if x[0].replace(" ", "") == exact_name]
+            if exact:
+                return exact[0]
+        return min(candidates, key=lambda x: (len(x[0]), x[0]))
 
-    def pick(lst):
-        return min(lst, key=lambda x: (len(x[0]), x[0])) if lst else None
-
-    exact_eq = [x for x in eq if x[0].replace(" ", "") == "자본총계"]
-    return pick(rev), pick(op), pick(net), (exact_eq[0] if exact_eq else pick(eq))
+    return (
+        choose(revenue_candidates),
+        choose(operating_candidates),
+        choose(net_candidates),
+        choose(equity_candidates, "자본총계"),
+    )
 
 
-def request_json(url, params):
-    try:
-        r = HTTP.get(url, params=params, timeout=(5, 15))
-        r.raise_for_status()
-        return r.json()
-    except Exception:
-        return {}
-
-
-def fetch_year(corp_code, year):
-    revenue = operating = net_income = equity = None
-
+def fetch_report(corp_code, year, report_code):
     for fs_div in ("CFS", "OFS"):
         data = request_json(
             "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json",
@@ -180,142 +198,23 @@ def fetch_year(corp_code, year):
                 "crtfc_key": DART_API_KEY,
                 "corp_code": corp_code,
                 "bsns_year": str(year),
-                "reprt_code": "11011",
+                "reprt_code": report_code,
                 "fs_div": fs_div,
             },
         )
-        if data.get("status") != "000":
-            continue
-
-        r, o, n, e = pick_accounts(data.get("list", []), fs_div)
-        revenue = revenue or r
-        operating = operating or o
-        net_income = net_income or n
-        equity = equity or e
-
-        if revenue and operating and net_income and equity:
-            break
-
-    if not (revenue and operating and net_income and equity):
-        data = request_json(
-            "https://opendart.fss.or.kr/api/fnlttSinglAcnt.json",
-            {
-                "crtfc_key": DART_API_KEY,
-                "corp_code": corp_code,
-                "bsns_year": str(year),
-                "reprt_code": "11011",
-            },
-        )
-        if data.get("status") == "000":
-            r, o, n, e = pick_accounts(data.get("list", []), "FALLBACK")
-            revenue = revenue or r
-            operating = operating or o
-            net_income = net_income or n
-            equity = equity or e
-
-    return revenue, operating, net_income, equity
+        if data.get("status") == "000" and data.get("list"):
+            revenue, operating, net_income, equity = pick_accounts(data["list"], fs_div)
+            return {
+                "revenue": revenue[2] if revenue else None,
+                "operating_income": operating[2] if operating else None,
+                "net_income": net_income[2] if net_income else None,
+                "equity": equity[2] if equity else None,
+                "fs_div": fs_div,
+            }
+    return None
 
 
-def build_financial_csv(market_df):
-    print("[3/3] financial_data.csv 생성")
-
-    corp = get_corp_codes()
-    stocks = market_df[["종목코드", "종목명"]].copy()
-    stocks.columns = ["ticker", "name"]
-    stocks["ticker"] = stocks["ticker"].map(clean_ticker)
-
-    merged = stocks.merge(
-        corp[["ticker", "corp_code"]],
-        on="ticker",
-        how="left",
-    )
-
-    end_year = datetime.today().year - 1
-    start_year = end_year - YEARS + 1
-    rows = []
-
-    for idx, row in merged.iterrows():
-        ticker = row["ticker"]
-        name = row["name"]
-        corp_code = row.get("corp_code")
-
-        print(f"[{idx + 1}/{len(merged)}] {name} ({ticker})")
-
-        if pd.isna(corp_code):
-            continue
-
-        for year in range(start_year, end_year + 1):
-            revenue, operating, net_income, equity = fetch_year(str(corp_code), year)
-
-            rev = revenue[2] if revenue else None
-            op = operating[2] if operating else None
-            net = net_income[2] if net_income else None
-            eq = equity[2] if equity else None
-
-            rows.append({
-                "name": name,
-                "ticker": ticker,
-                "year": year,
-                "revenue": rev,
-                "operating_income": op,
-                "net_income": net,
-                "equity": eq,
-                "operating_margin": (op / rev * 100) if rev not in (None, 0) and op is not None else None,
-                "revenue_account_nm": revenue[0] if revenue else None,
-                "op_account_nm": operating[0] if operating else None,
-                "net_account_nm": net_income[0] if net_income else None,
-                "equity_account_nm": equity[0] if equity else None,
-                "fs_div": (
-                    operating[3] if operating else
-                    revenue[3] if revenue else
-                    net_income[3] if net_income else
-                    equity[3] if equity else None
-                ),
-            })
-            time.sleep(0.05)
-
-    pd.DataFrame(rows).to_csv(FINANCIAL_FILE, index=False, encoding="utf-8-sig")
-    print(f"financial_data.csv 완료: {len(rows):,}행", flush=True)
-
-
-
-def fetch_report(corp_code, year, reprt_code):
-    data = request_json(
-        "https://opendart.fss.or.kr/api/fnlttSinglAcnt.json",
-        {
-            "crtfc_key": DART_API_KEY,
-            "corp_code": corp_code,
-            "bsns_year": str(year),
-            "reprt_code": reprt_code,
-        },
-    )
-    if data.get("status") != "000":
-        return None, None, None, None, None
-
-    items = data.get("list", [])
-    cfs = [x for x in items if str(x.get("fs_div", "")).strip() == "CFS"]
-    ofs = [x for x in items if str(x.get("fs_div", "")).strip() == "OFS"]
-
-    revenue = operating = net_income = equity = None
-    fs_used = None
-
-    if cfs:
-        revenue, operating, net_income, equity = pick_accounts(cfs, "CFS")
-        fs_used = "CFS"
-
-    if not (revenue and operating and net_income and equity) and ofs:
-        r, o, n, e = pick_accounts(ofs, "OFS")
-        revenue = revenue or r
-        operating = operating or o
-        net_income = net_income or n
-        equity = equity or e
-        if fs_used is None:
-            fs_used = "OFS"
-
-    return revenue, operating, net_income, equity, fs_used
-
-
-def subtract_value(current, previous):
+def subtract_current(current, previous):
     if current is None:
         return None
     if previous is None:
@@ -323,20 +222,22 @@ def subtract_value(current, previous):
     return current - previous
 
 
-def build_quarterly_financial_csv(market_df):
-    print("[4/4] financial_quarterly.csv 생성", flush=True)
+def main():
+    print("=== 분기 재무 업데이트 시작 ===", flush=True)
 
-    targets = load_financial_targets(market_df)
-    if targets.empty:
-        print("분기 재무 수집 대상이 없어 건너뜁니다.", flush=True)
-        return
+    if not DART_API_KEY:
+        raise RuntimeError("GitHub Secret DART_API_KEY가 없습니다.")
 
+    os.makedirs(DATA_DIR, exist_ok=True)
+    targets = load_targets()
     corp = get_corp_codes()
-    merged = targets.merge(corp[["ticker", "corp_code"]], on="ticker", how="left")
 
-    end_year = datetime.today().year
-    start_year = end_year - YEARS + 1
-    rows = []
+    merged = targets.merge(
+        corp[["corp_code", "stock_code"]],
+        left_on="ticker",
+        right_on="stock_code",
+        how="left",
+    )
 
     report_map = {
         1: ("11013", "03-31"),
@@ -345,42 +246,42 @@ def build_quarterly_financial_csv(market_df):
         4: ("11011", "12-31"),
     }
 
+    current_year = datetime.today().year
+    start_year = current_year - YEARS + 1
+    rows = []
+
+    print("[3/4] DART 분기 데이터 수집", flush=True)
+
     for idx, row in merged.iterrows():
         ticker = row["ticker"]
         name = row["name"]
         corp_code = row.get("corp_code")
 
-        print(f"[분기 {idx + 1}/{len(merged)}] {name} ({ticker})", flush=True)
+        print(f"[{idx + 1}/{len(merged)}] {name} ({ticker})", flush=True)
 
         if pd.isna(corp_code):
+            print("  - DART corp_code 없음, 건너뜀", flush=True)
             continue
 
-        for year in range(start_year, end_year + 1):
+        for year in range(start_year, current_year + 1):
             cumulative = {}
 
-            for quarter, (reprt_code, _) in report_map.items():
-                revenue, operating, net_income, equity, fs_used = fetch_report(
-                    str(corp_code), year, reprt_code
-                )
-                cumulative[quarter] = {
-                    "revenue": revenue[2] if revenue else None,
-                    "operating_income": operating[2] if operating else None,
-                    "net_income": net_income[2] if net_income else None,
-                    "equity": equity[2] if equity else None,
-                    "fs_div": fs_used,
-                }
-                time.sleep(0.03)
+            for quarter, (report_code, _) in report_map.items():
+                cumulative[quarter] = fetch_report(str(corp_code), year, report_code)
+                time.sleep(0.05)
 
-            prev = {"revenue": None, "operating_income": None, "net_income": None}
+            previous = {"revenue": None, "operating_income": None, "net_income": None}
 
             for quarter, (_, month_day) in report_map.items():
-                cur = cumulative[quarter]
+                current = cumulative.get(quarter)
+                if not current:
+                    continue
 
-                q_revenue = subtract_value(cur["revenue"], prev["revenue"])
-                q_operating = subtract_value(cur["operating_income"], prev["operating_income"])
-                q_net = subtract_value(cur["net_income"], prev["net_income"])
+                q_revenue = subtract_current(current["revenue"], previous["revenue"])
+                q_operating = subtract_current(current["operating_income"], previous["operating_income"])
+                q_net = subtract_current(current["net_income"], previous["net_income"])
 
-                if all(v is None for v in [q_revenue, q_operating, q_net, cur["equity"]]):
+                if all(v is None for v in [q_revenue, q_operating, q_net, current["equity"]]):
                     continue
 
                 rows.append({
@@ -393,35 +294,28 @@ def build_quarterly_financial_csv(market_df):
                     "revenue": q_revenue,
                     "operating_income": q_operating,
                     "net_income": q_net,
-                    "equity": cur["equity"],
+                    "equity": current["equity"],
                     "operating_margin": (
                         q_operating / q_revenue * 100
                         if q_revenue not in (None, 0) and q_operating is not None
                         else None
                     ),
-                    "fs_div": cur["fs_div"],
+                    "fs_div": current["fs_div"],
                 })
 
-                for key in ["revenue", "operating_income", "net_income"]:
-                    if cur[key] is not None:
-                        prev[key] = cur[key]
+                for key in previous:
+                    if current[key] is not None:
+                        previous[key] = current[key]
 
-    pd.DataFrame(rows).to_csv(
-        QUARTERLY_FILE,
-        index=False,
-        encoding="utf-8-sig",
-    )
-    print(f"financial_quarterly.csv 완료: {len(rows):,}행", flush=True)
+    print("[4/4] CSV 저장", flush=True)
 
-def main():
-    print("=== 분기 재무 업데이트 시작 ===", flush=True)
-    os.makedirs(DATA_DIR, exist_ok=True)
+    if not rows:
+        raise RuntimeError("분기 재무 데이터를 한 건도 수집하지 못했습니다.")
 
-    market_df = build_market_csv()
+    result_df = pd.DataFrame(rows)
+    result_df.to_csv(QUARTERLY_FILE, index=False, encoding="utf-8-sig")
 
-    print("[2/2] 분기 재무 생성 시작", flush=True)
-    build_quarterly_financial_csv(market_df)
-
+    print(f"financial_quarterly.csv 완료: {len(result_df):,}행", flush=True)
     print("=== 분기 재무 업데이트 완료 ===", flush=True)
 
 
