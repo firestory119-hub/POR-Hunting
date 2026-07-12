@@ -12,7 +12,7 @@ import streamlit as st
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v26.2 CSV", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v26.2 CSV Stable", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -27,7 +27,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 
 
-st.title("POR Hunting Pro v26.2 CSV")
+st.title("POR Hunting Pro v26.2 CSV Stable")
 st.caption("CSV 재무 + CSV 시가총액 + POR/PER/PBR 밴드 + 미래 POR 시뮬레이터")
 
 
@@ -47,21 +47,41 @@ def clean_num(x):
 
 
 def load_list_csv(path: str, columns: list[str]) -> pd.DataFrame:
-    if os.path.exists(path):
-        try:
-            df = pd.read_csv(path, dtype=str)
-            for c in columns:
-                if c not in df.columns:
-                    df[c] = ""
-            return df[columns].drop_duplicates().copy()
-        except Exception:
-            pass
-    return pd.DataFrame(columns=columns)
+    """
+    CSV는 초기값만 읽고, 이후 변경은 세션 메모리에만 저장합니다.
+    Streamlit Cloud에서 실행 중 파일을 수정하면 자동 재실행 루프가 생길 수 있습니다.
+    """
+    state_key = f"_session_{os.path.basename(path)}"
+
+    if state_key not in st.session_state:
+        if os.path.exists(path):
+            try:
+                df = pd.read_csv(path, dtype=str)
+            except Exception:
+                df = pd.DataFrame(columns=columns)
+        else:
+            df = pd.DataFrame(columns=columns)
+
+        for c in columns:
+            if c not in df.columns:
+                df[c] = ""
+
+        st.session_state[state_key] = df[columns].drop_duplicates().copy()
+
+    df = st.session_state[state_key].copy()
+    for c in columns:
+        if c not in df.columns:
+            df[c] = ""
+
+    return df[columns].drop_duplicates().copy()
 
 
 def save_list_csv(df: pd.DataFrame, path: str):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    df.drop_duplicates().to_csv(path, index=False, encoding="utf-8-sig")
+    """
+    저장소 파일에는 쓰지 않고 현재 세션에만 저장합니다.
+    """
+    state_key = f"_session_{os.path.basename(path)}"
+    st.session_state[state_key] = df.drop_duplicates().copy()
 
 
 def add_favorite(name: str, ticker: str):
@@ -83,6 +103,13 @@ def remove_favorite(ticker: str):
 
 
 def add_history(name: str, ticker: str):
+    """
+    같은 세션에서 같은 종목은 한 번만 최근검색에 추가합니다.
+    """
+    guard_key = f"_history_added_{ticker}"
+    if st.session_state.get(guard_key):
+        return
+
     hist = load_list_csv(HISTORY_FILE, ["name", "ticker", "searched_at"])
     new_row = pd.DataFrame([{
         "name": name,
@@ -93,6 +120,7 @@ def add_history(name: str, ticker: str):
     hist = hist.drop_duplicates(subset=["ticker"], keep="last")
     hist = hist.sort_values("searched_at", ascending=False).head(50)
     save_list_csv(hist, HISTORY_FILE)
+    st.session_state[guard_key] = True
 
 
 # =========================
@@ -527,16 +555,9 @@ with st.sidebar:
     st.header("설정")
 
     saved_key = ""
-    if os.path.exists(API_KEY_FILE):
-        try:
-            with open(API_KEY_FILE, "r", encoding="utf-8") as f:
-                saved_key = f.read().strip()
-        except Exception:
-            saved_key = ""
-
     api_key = st.text_input(
         "OpenDART API Key (CSV 모드에서는 불필요)",
-        value=saved_key,
+        value="",
         type="password"
     )
 
