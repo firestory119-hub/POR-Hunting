@@ -33,7 +33,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas==2.2.3 requests FinanceDataReader
+          pip install pandas==2.2.3 requests git+https://github.com/FinanceData/FinanceDataReader.git
 
       - name: Update and commit
         env:
