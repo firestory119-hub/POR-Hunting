@@ -12,7 +12,7 @@ import streamlit as st
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v26.2 CSV Stable", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v26.3 Daily", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -22,12 +22,13 @@ HISTORY_FILE = os.path.join(DATA_DIR, "search_history.csv")
 MARKET_DATA_CSV = os.path.join(DATA_DIR, "market_data.csv")
 FINANCIAL_DATA_CSV = os.path.join(DATA_DIR, "financial_data.csv")
 QUARTERLY_DATA_CSV = os.path.join(DATA_DIR, "financial_quarterly.csv")
+MARKET_HISTORY_CSV = os.path.join(DATA_DIR, "market_history.csv")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
 
-st.title("POR Hunting Pro v26.2 CSV Stable")
+st.title("POR Hunting Pro v26.3 Daily")
 st.caption("CSV 재무 + CSV 시가총액 + POR/PER/PBR 밴드 + 미래 POR 시뮬레이터")
 
 
@@ -260,41 +261,25 @@ def _load_quarterly_for_ticker(ticker: str, start_year: int, end_year: int) -> p
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_market_cap(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """
-    외부 API를 호출하지 않습니다.
-    market_data.csv의 현재 시가총액/현재가를 분기 또는 연도 시점에 배치합니다.
-    financial_quarterly.csv가 있으면 분기 단위, 없으면 연도 단위로 표시합니다.
-    """
-    market = _load_market_csv()
-    row = market[market["종목코드"] == str(ticker).zfill(6)]
-    if row.empty:
-        return pd.DataFrame()
+    if not os.path.exists(MARKET_HISTORY_CSV):
+        raise RuntimeError("data/market_history.csv가 없습니다.")
 
-    current_price = clean_num(row.iloc[0].get("현재가"))
-    current_mcap_eok = clean_num(row.iloc[0].get("현재시총_억원"))
+    df = pd.read_csv(MARKET_HISTORY_CSV, dtype={"ticker": str})
+    df["ticker"] = df["ticker"].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(6)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df["market_cap"] = pd.to_numeric(df["market_cap"], errors="coerce")
 
-    if not current_mcap_eok or current_mcap_eok <= 0:
-        return pd.DataFrame()
+    start = pd.to_datetime(start_date, format="%Y%m%d")
+    end = pd.to_datetime(end_date, format="%Y%m%d")
 
-    start_year = int(start_date[:4])
-    end_year = int(end_date[:4])
+    out = df[
+        (df["ticker"] == str(ticker).zfill(6))
+        & (df["date"] >= start)
+        & (df["date"] <= end)
+    ][["date", "market_cap", "price"]].copy()
 
-    quarterly = _load_quarterly_for_ticker(ticker, start_year, end_year)
-    dates = []
-
-    if not quarterly.empty and quarterly["period_end"].notna().any():
-        dates = quarterly["period_end"].dropna().drop_duplicates().tolist()
-    else:
-        dates = [
-            pd.Timestamp(year=year, month=12, day=31)
-            for year in range(start_year, end_year + 1)
-        ]
-
-    return pd.DataFrame({
-        "date": dates,
-        "market_cap": [float(current_mcap_eok) * 100_000_000] * len(dates),
-        "price": [float(current_price) if current_price else None] * len(dates),
-    })
+    return out.dropna(subset=["date", "market_cap"]).sort_values("date").reset_index(drop=True)
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
