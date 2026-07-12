@@ -42,10 +42,10 @@ def clean_ticker(value):
     return digits.zfill(6) if digits else None
 
 
-def request_json(url, params, retries=3):
+def request_json(url, params, retries=5):
     for attempt in range(retries):
         try:
-            response = HTTP.get(url, params=params, timeout=(5, 20))
+            response = HTTP.get(url, params=params, timeout=(20, 60))
             response.raise_for_status()
             return response.json()
         except Exception as exc:
@@ -268,7 +268,7 @@ def main():
 
             for quarter, (report_code, _) in report_map.items():
                 cumulative[quarter] = fetch_report(str(corp_code), year, report_code)
-                time.sleep(0.05)
+                time.sleep(0.5)
 
             previous = {"revenue": None, "operating_income": None, "net_income": None}
 
