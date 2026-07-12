@@ -1,4 +1,5 @@
 import os
+import csv
 import re
 from datetime import datetime
 
@@ -12,7 +13,7 @@ import streamlit as st
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v26.3 Daily Stable", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v27", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -28,7 +29,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 
 
-st.title("POR Hunting Pro v26.3 Daily Stable")
+st.title("POR Hunting Pro v27")
 st.caption("CSV 재무 + CSV 시가총액 + POR/PER/PBR 밴드 + 미래 POR 시뮬레이터")
 
 
@@ -262,66 +263,40 @@ def _load_quarterly_for_ticker(ticker: str, start_year: int, end_year: int) -> p
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_market_cap(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
     """
-    data/market_history.csv에서 해당 종목의 일별 주가·시가총액만 읽습니다.
-    큰 CSV 전체를 한 번에 메모리에 올리지 않고 chunksize로 나눠 읽어
-    Streamlit Cloud 메모리 오류를 방지합니다.
+    외부 API를 호출하지 않습니다.
+    market_data.csv의 현재 시가총액/현재가를 분기 또는 연도 시점에 배치합니다.
+    financial_quarterly.csv가 있으면 분기 단위, 없으면 연도 단위로 표시합니다.
     """
-    if not os.path.exists(MARKET_HISTORY_CSV):
-        raise RuntimeError(
-            "data/market_history.csv가 없습니다. "
-            "GitHub Actions의 일별 업데이트를 먼저 실행하세요."
-        )
+    market = _load_market_csv()
+    row = market[market["종목코드"] == str(ticker).zfill(6)]
+    if row.empty:
+        return pd.DataFrame()
 
-    target = str(ticker).zfill(6)
-    start = pd.to_datetime(start_date, format="%Y%m%d", errors="coerce")
-    end = pd.to_datetime(end_date, format="%Y%m%d", errors="coerce")
+    current_price = clean_num(row.iloc[0].get("현재가"))
+    current_mcap_eok = clean_num(row.iloc[0].get("현재시총_억원"))
 
-    parts = []
-    usecols = ["ticker", "date", "price", "market_cap"]
+    if not current_mcap_eok or current_mcap_eok <= 0:
+        return pd.DataFrame()
 
-    try:
-        reader = pd.read_csv(
-            MARKET_HISTORY_CSV,
-            dtype={"ticker": str},
-            usecols=usecols,
-            chunksize=50000,
-        )
-    except Exception as exc:
-        raise RuntimeError(f"market_history.csv 읽기 실패: {exc}") from exc
+    start_year = int(start_date[:4])
+    end_year = int(end_date[:4])
 
-    for chunk in reader:
-        chunk["ticker"] = (
-            chunk["ticker"].astype(str)
-            .str.replace(r"\.0$", "", regex=True)
-            .str.zfill(6)
-        )
+    quarterly = _load_quarterly_for_ticker(ticker, start_year, end_year)
+    dates = []
 
-        chunk = chunk[chunk["ticker"] == target].copy()
-        if chunk.empty:
-            continue
+    if not quarterly.empty and quarterly["period_end"].notna().any():
+        dates = quarterly["period_end"].dropna().drop_duplicates().tolist()
+    else:
+        dates = [
+            pd.Timestamp(year=year, month=12, day=31)
+            for year in range(start_year, end_year + 1)
+        ]
 
-        chunk["date"] = pd.to_datetime(chunk["date"], errors="coerce")
-        chunk["price"] = pd.to_numeric(chunk["price"], errors="coerce")
-        chunk["market_cap"] = pd.to_numeric(chunk["market_cap"], errors="coerce")
-
-        chunk = chunk[
-            (chunk["date"] >= start)
-            & (chunk["date"] <= end)
-        ][["date", "market_cap", "price"]]
-
-        if not chunk.empty:
-            parts.append(chunk)
-
-    if not parts:
-        return pd.DataFrame(columns=["date", "market_cap", "price"])
-
-    out = pd.concat(parts, ignore_index=True)
-    return (
-        out.dropna(subset=["date", "market_cap"])
-        .drop_duplicates("date", keep="last")
-        .sort_values("date")
-        .reset_index(drop=True)
-    )
+    return pd.DataFrame({
+        "date": dates,
+        "market_cap": [float(current_mcap_eok) * 100_000_000] * len(dates),
+        "price": [float(current_price) if current_price else None] * len(dates),
+    })
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
@@ -334,6 +309,64 @@ def get_current_price(ticker: str):
     value = clean_num(row.iloc[0].get("현재가"))
     return value if value and value > 0 else None
 
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def load_daily_history_on_demand(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    버튼을 눌렀을 때만 market_history.csv를 한 줄씩 읽습니다.
+    pandas.read_csv로 대용량 파일 전체를 읽지 않아 메모리 사용을 최소화합니다.
+    """
+    columns = ["date", "price", "market_cap"]
+
+    if not os.path.exists(MARKET_HISTORY_CSV):
+        return pd.DataFrame(columns=columns)
+
+    target = str(ticker).zfill(6)
+    start = pd.to_datetime(start_date, format="%Y%m%d", errors="coerce")
+    end = pd.to_datetime(end_date, format="%Y%m%d", errors="coerce")
+
+    rows = []
+
+    try:
+        with open(MARKET_HISTORY_CSV, "r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+
+            required = {"ticker", "date", "price", "market_cap"}
+            if not required.issubset(set(reader.fieldnames or [])):
+                return pd.DataFrame(columns=columns)
+
+            for row in reader:
+                code = str(row.get("ticker", "")).strip().replace(".0", "").zfill(6)
+                if code != target:
+                    continue
+
+                date_value = pd.to_datetime(row.get("date"), errors="coerce")
+                if pd.isna(date_value) or date_value < start or date_value > end:
+                    continue
+
+                price_value = clean_num(row.get("price"))
+                market_cap_value = clean_num(row.get("market_cap"))
+                if market_cap_value is None:
+                    continue
+
+                rows.append({
+                    "date": date_value,
+                    "price": price_value,
+                    "market_cap": market_cap_value,
+                })
+    except Exception:
+        return pd.DataFrame(columns=columns)
+
+    if not rows:
+        return pd.DataFrame(columns=columns)
+
+    return (
+        pd.DataFrame(rows)
+        .drop_duplicates("date", keep="last")
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
 
 def make_valuation_df(
     mcap_df: pd.DataFrame,
@@ -862,6 +895,57 @@ if run:
             )
     except Exception:
         pass
+
+    st.markdown("### 일별 밴드")
+    daily_button = st.button(
+        "일별 차트 불러오기",
+        key=f"load_daily_{ticker}_{valuation_metric}_{chart_range}",
+        help="버튼을 누를 때만 market_history.csv에서 선택 종목의 일별 데이터를 읽습니다.",
+    )
+
+    if daily_button:
+        with st.spinner("선택 종목의 일별 데이터를 불러오는 중..."):
+            daily_mcap_df = load_daily_history_on_demand(
+                ticker,
+                start_date,
+                end_date,
+            )
+
+        if daily_mcap_df.empty:
+            st.warning(
+                "이 종목의 일별 데이터가 없습니다. "
+                "update_market_daily.py의 수집 대상에 포함됐는지 확인하세요."
+            )
+        else:
+            daily_val_df = make_valuation_df(
+                daily_mcap_df,
+                fin_df,
+                valuation_metric,
+                int(forward_year),
+                forward_oi_eok if forward_oi_eok > 0 else None,
+            )
+
+            if daily_val_df.empty:
+                st.warning("일별 밴드 계산에 사용할 재무 기준값이 없습니다.")
+            else:
+                daily_fig, daily_mean, daily_std, daily_count, daily_start, _ = plot_valuation(
+                    daily_val_df,
+                    f"{name} Daily Multiple",
+                    valuation_metric,
+                    chart_range,
+                    projected_info,
+                )
+                st.plotly_chart(
+                    daily_fig,
+                    width="stretch",
+                    key=f"daily_chart_{ticker}_{valuation_metric}_{chart_range}",
+                )
+
+                d1, d2, d3, d4 = st.columns(4)
+                d1.metric(f"일별 평균 {valuation_metric}", f"{daily_mean:.2f}")
+                d2.metric("일별 표준편차 σ", f"{daily_std:.2f}")
+                d3.metric("일별 시작일", daily_start.strftime("%Y-%m-%d"))
+                d4.metric("일별 표본 수", f"{daily_count}개")
 
     if projected_info is not None:
         st.markdown("### 미래 POR 시뮬레이션")
