@@ -40,13 +40,39 @@ jobs:
         run: python update_market_daily.py
 
       - name: Commit CSV
+        env:
+          INPUT_TICKER: ${{ inputs.ticker }}
+          INPUT_NAME: ${{ inputs.name }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/market_history.csv
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "Update daily history for ${{ inputs.name }} (${{ inputs.ticker }})"
-            git push
-          fi
+
+          for attempt in 1 2 3
+          do
+            echo "저장 시도: $attempt/3"
+
+            git fetch origin main
+            git reset --hard origin/main
+
+            python update_market_daily.py
+
+            git add data/market_history.csv
+
+            if git diff --cached --quiet; then
+              echo "변경된 데이터가 없습니다."
+              exit 0
+            fi
+
+            git commit -m "Update daily history for ${INPUT_NAME} (${INPUT_TICKER})"
+
+            if git push origin HEAD:main; then
+              echo "저장 성공"
+              exit 0
+            fi
+
+            echo "충돌 발생. 5초 후 재시도..."
+            sleep 5
+          done
+
+          echo "3회 재시도 후에도 저장 실패"
+          exit 1
