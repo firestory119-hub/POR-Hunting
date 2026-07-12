@@ -1,5 +1,8 @@
 import os
 import csv
+import json
+import urllib.request
+import urllib.error
 import re
 from datetime import datetime
 
@@ -13,7 +16,7 @@ import streamlit as st
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v27 Integrated", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v27 Auto Daily", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -24,13 +27,16 @@ MARKET_DATA_CSV = os.path.join(DATA_DIR, "market_data.csv")
 FINANCIAL_DATA_CSV = os.path.join(DATA_DIR, "financial_data.csv")
 QUARTERLY_DATA_CSV = os.path.join(DATA_DIR, "financial_quarterly.csv")
 MARKET_HISTORY_CSV = os.path.join(DATA_DIR, "market_history.csv")
+GITHUB_OWNER = "firestory119-hub"
+GITHUB_REPO = "POR-Hunting"
+GITHUB_WORKFLOW = "update_one_daily.yml"
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
 
-st.title("POR Hunting Pro v27 Integrated")
-st.caption("연도·분기·일별 POR/PER/PBR 밴드 + 미래 시뮬레이터")
+st.title("POR Hunting Pro v27 Auto Daily")
+st.caption("연도·분기·일별 밴드 + 종목별 자동 일별 수집")
 
 
 # =========================
@@ -412,6 +418,58 @@ def get_current_price(ticker: str):
     value = clean_num(row.iloc[0].get("현재가"))
     return value if value and value > 0 else None
 
+
+
+def request_daily_collection(ticker: str, name: str) -> tuple[bool, str]:
+    """
+    Streamlit Secrets의 GITHUB_TOKEN으로 GitHub Actions를 실행합니다.
+    """
+    try:
+        token = str(st.secrets["GITHUB_TOKEN"]).strip()
+    except Exception:
+        return False, "Streamlit Secrets에 GITHUB_TOKEN이 없습니다."
+
+    if not token:
+        return False, "Streamlit Secrets의 GITHUB_TOKEN이 비어 있습니다."
+
+    url = (
+        f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
+        f"/actions/workflows/{GITHUB_WORKFLOW}/dispatches"
+    )
+
+    payload = json.dumps(
+        {
+            "ref": "main",
+            "inputs": {
+                "ticker": str(ticker).zfill(6),
+                "name": str(name),
+            },
+        }
+    ).encode("utf-8")
+
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "POR-Hunting-Pro",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            if response.status == 204:
+                return True, "일별 데이터 수집을 요청했습니다."
+            return False, f"GitHub 응답 코드: {response.status}"
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")[:300]
+        return False, f"GitHub 요청 실패({exc.code}): {detail}"
+    except Exception as exc:
+        return False, f"GitHub 요청 실패: {exc}"
 
 def make_valuation_df(
     mcap_df: pd.DataFrame,
@@ -850,9 +908,24 @@ if run:
 
     if mcap_df.empty:
         if chart_mode == "일별":
-            st.error(
-                f"{name}의 일별 데이터가 없습니다. "
-                "GitHub Actions에서 update_market_daily.py를 실행해 주세요."
+            st.warning(f"{name}의 일별 데이터가 아직 없습니다.")
+
+            if st.button(
+                "이 종목 일별 데이터 수집 요청",
+                type="primary",
+                key=f"request_daily_{ticker}",
+            ):
+                ok, message = request_daily_collection(ticker, name)
+                if ok:
+                    st.success(
+                        message
+                        + " 보통 1~3분 뒤 새로고침하면 일별 차트를 볼 수 있습니다."
+                    )
+                else:
+                    st.error(message)
+
+            st.caption(
+                "한 번 수집된 종목은 이후 GitHub Actions에서 기존 데이터 뒤를 이어 갱신됩니다."
             )
         else:
             st.error("시가총액 데이터를 가져오지 못했습니다.")

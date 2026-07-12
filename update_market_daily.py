@@ -17,6 +17,9 @@ OUTPUT_FILE = os.path.join(DATA_DIR, "market_history.csv")
 YEARS = 10
 SLEEP_SECONDS = 0.3
 
+INPUT_TICKER_RAW = os.getenv("INPUT_TICKER", "").strip()
+INPUT_NAME = os.getenv("INPUT_NAME", "").strip()
+
 
 def clean_num(value):
     if value is None:
@@ -107,6 +110,21 @@ def read_target_file(path):
 
 
 def load_targets(market):
+    if INPUT_TICKER_RAW:
+        ticker = clean_ticker(INPUT_TICKER_RAW)
+        if not ticker:
+            raise RuntimeError("입력된 종목코드가 올바르지 않습니다.")
+
+        market_row = market[market["종목코드"] == ticker]
+        resolved_name = INPUT_NAME
+        if not resolved_name and not market_row.empty:
+            resolved_name = str(market_row.iloc[0]["종목명"])
+
+        return pd.DataFrame([{
+            "ticker": ticker,
+            "name": resolved_name or ticker,
+        }])
+
     frames = []
 
     # 앱에서 실제 조회 가능한 종목 목록
