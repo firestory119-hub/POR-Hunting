@@ -1,5 +1,4 @@
 import os
-import csv
 import re
 from datetime import datetime
 
@@ -13,7 +12,7 @@ import streamlit as st
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v27", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v26.2 CSV Stable", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -23,13 +22,12 @@ HISTORY_FILE = os.path.join(DATA_DIR, "search_history.csv")
 MARKET_DATA_CSV = os.path.join(DATA_DIR, "market_data.csv")
 FINANCIAL_DATA_CSV = os.path.join(DATA_DIR, "financial_data.csv")
 QUARTERLY_DATA_CSV = os.path.join(DATA_DIR, "financial_quarterly.csv")
-MARKET_HISTORY_CSV = os.path.join(DATA_DIR, "market_history.csv")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
 
-st.title("POR Hunting Pro v27")
+st.title("POR Hunting Pro v26.2 CSV Stable")
 st.caption("CSV 재무 + CSV 시가총액 + POR/PER/PBR 밴드 + 미래 POR 시뮬레이터")
 
 
@@ -309,64 +307,6 @@ def get_current_price(ticker: str):
     value = clean_num(row.iloc[0].get("현재가"))
     return value if value and value > 0 else None
 
-
-
-@st.cache_data(show_spinner=False, ttl=1800)
-def load_daily_history_on_demand(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """
-    버튼을 눌렀을 때만 market_history.csv를 한 줄씩 읽습니다.
-    pandas.read_csv로 대용량 파일 전체를 읽지 않아 메모리 사용을 최소화합니다.
-    """
-    columns = ["date", "price", "market_cap"]
-
-    if not os.path.exists(MARKET_HISTORY_CSV):
-        return pd.DataFrame(columns=columns)
-
-    target = str(ticker).zfill(6)
-    start = pd.to_datetime(start_date, format="%Y%m%d", errors="coerce")
-    end = pd.to_datetime(end_date, format="%Y%m%d", errors="coerce")
-
-    rows = []
-
-    try:
-        with open(MARKET_HISTORY_CSV, "r", encoding="utf-8-sig", newline="") as handle:
-            reader = csv.DictReader(handle)
-
-            required = {"ticker", "date", "price", "market_cap"}
-            if not required.issubset(set(reader.fieldnames or [])):
-                return pd.DataFrame(columns=columns)
-
-            for row in reader:
-                code = str(row.get("ticker", "")).strip().replace(".0", "").zfill(6)
-                if code != target:
-                    continue
-
-                date_value = pd.to_datetime(row.get("date"), errors="coerce")
-                if pd.isna(date_value) or date_value < start or date_value > end:
-                    continue
-
-                price_value = clean_num(row.get("price"))
-                market_cap_value = clean_num(row.get("market_cap"))
-                if market_cap_value is None:
-                    continue
-
-                rows.append({
-                    "date": date_value,
-                    "price": price_value,
-                    "market_cap": market_cap_value,
-                })
-    except Exception:
-        return pd.DataFrame(columns=columns)
-
-    if not rows:
-        return pd.DataFrame(columns=columns)
-
-    return (
-        pd.DataFrame(rows)
-        .drop_duplicates("date", keep="last")
-        .sort_values("date")
-        .reset_index(drop=True)
-    )
 
 def make_valuation_df(
     mcap_df: pd.DataFrame,
@@ -895,57 +835,6 @@ if run:
             )
     except Exception:
         pass
-
-    st.markdown("### 일별 밴드")
-    daily_button = st.button(
-        "일별 차트 불러오기",
-        key=f"load_daily_{ticker}_{valuation_metric}_{chart_range}",
-        help="버튼을 누를 때만 market_history.csv에서 선택 종목의 일별 데이터를 읽습니다.",
-    )
-
-    if daily_button:
-        with st.spinner("선택 종목의 일별 데이터를 불러오는 중..."):
-            daily_mcap_df = load_daily_history_on_demand(
-                ticker,
-                start_date,
-                end_date,
-            )
-
-        if daily_mcap_df.empty:
-            st.warning(
-                "이 종목의 일별 데이터가 없습니다. "
-                "update_market_daily.py의 수집 대상에 포함됐는지 확인하세요."
-            )
-        else:
-            daily_val_df = make_valuation_df(
-                daily_mcap_df,
-                fin_df,
-                valuation_metric,
-                int(forward_year),
-                forward_oi_eok if forward_oi_eok > 0 else None,
-            )
-
-            if daily_val_df.empty:
-                st.warning("일별 밴드 계산에 사용할 재무 기준값이 없습니다.")
-            else:
-                daily_fig, daily_mean, daily_std, daily_count, daily_start, _ = plot_valuation(
-                    daily_val_df,
-                    f"{name} Daily Multiple",
-                    valuation_metric,
-                    chart_range,
-                    projected_info,
-                )
-                st.plotly_chart(
-                    daily_fig,
-                    width="stretch",
-                    key=f"daily_chart_{ticker}_{valuation_metric}_{chart_range}",
-                )
-
-                d1, d2, d3, d4 = st.columns(4)
-                d1.metric(f"일별 평균 {valuation_metric}", f"{daily_mean:.2f}")
-                d2.metric("일별 표준편차 σ", f"{daily_std:.2f}")
-                d3.metric("일별 시작일", daily_start.strftime("%Y-%m-%d"))
-                d4.metric("일별 표본 수", f"{daily_count}개")
 
     if projected_info is not None:
         st.markdown("### 미래 POR 시뮬레이션")
