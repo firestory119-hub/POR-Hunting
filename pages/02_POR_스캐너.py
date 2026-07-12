@@ -24,6 +24,8 @@ MARKET_FILE = DATA_DIR / "market_data.csv"
 GITHUB_OWNER = "firestory119-hub"
 GITHUB_REPO = "POR-Hunting"
 GITHUB_WORKFLOW = "update_one_daily.yml"
+GITHUB_BULK_WORKFLOW = "update_bulk_daily.yml"
+MAX_BULK_ITEMS = 10
 
 AUTO_REFRESH_SECONDS = 12
 AUTO_REFRESH_MAX_TRIES = 20
@@ -119,6 +121,169 @@ def request_collection(ticker, name):
         return False, f"GitHub 요청 실패({exc.code}): {detail}"
     except Exception as exc:
         return False, f"GitHub 요청 실패: {exc}"
+
+
+
+def request_bulk_collection(items):
+    try:
+        token = str(st.secrets["GITHUB_TOKEN"]).strip()
+    except Exception:
+        return False, "Streamlit Secrets에 GITHUB_TOKEN이 없습니다."
+
+    if not token:
+        return False, "Streamlit Secrets의 GITHUB_TOKEN이 비어 있습니다."
+
+    url = (
+        f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
+        f"/actions/workflows/{GITHUB_BULK_WORKFLOW}/dispatches"
+    )
+
+    payload = json.dumps(
+        {
+            "ref": "main",
+            "inputs": {
+                "items_json": json.dumps(
+                    items,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            },
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "POR-Hunting-Bulk-Scanner",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            if response.status == 204:
+                return True, "일괄 수집을 요청했습니다."
+            return False, f"GitHub 응답 코드: {response.status}"
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")[:300]
+        return False, f"GitHub 요청 실패({exc.code}): {detail}"
+    except Exception as exc:
+        return False, f"GitHub 요청 실패: {exc}"
+
+
+def parse_bulk_input(text, market):
+    tokens = []
+
+    for line in str(text).replace(",", "\n").splitlines():
+        token = line.strip()
+        if token:
+            tokens.append(token)
+
+    resolved = []
+    unresolved = []
+    seen = set()
+
+    for token in tokens:
+        code = clean_ticker(token)
+
+        if code and len("".join(ch for ch in token if ch.isdigit())) >= 5:
+            matched = market[market["종목코드"] == code]
+        else:
+            matched = market[
+                market["종목명"].astype(str).str.lower().eq(token.lower())
+            ]
+
+            if matched.empty:
+                matched = market[
+                    market["종목명"]
+                    .astype(str)
+                    .str.lower()
+                    .str.contains(token.lower(), na=False)
+                ]
+
+        if matched.empty:
+            unresolved.append(token)
+            continue
+
+        row = matched.iloc[0]
+        ticker = str(row["종목코드"]).zfill(6)
+
+        if ticker in seen:
+            continue
+
+        seen.add(ticker)
+        resolved.append(
+            {
+                "ticker": ticker,
+                "name": str(row["종목명"]),
+            }
+        )
+
+    return resolved, unresolved
+
+
+def start_bulk_polling(items):
+    st.session_state["bulk_collecting_items"] = items
+    st.session_state["bulk_poll_try"] = 0
+
+
+def auto_poll_bulk(history, financial):
+    items = st.session_state.get("bulk_collecting_items", [])
+
+    if not items:
+        return False
+
+    remaining = [
+        item
+        for item in items
+        if not is_collected(item["ticker"], history, financial)
+    ]
+
+    if not remaining:
+        st.session_state.pop("bulk_collecting_items", None)
+        st.session_state.pop("bulk_poll_try", None)
+        st.cache_data.clear()
+        st.success("선택한 종목의 일괄 수집이 모두 완료되었습니다.")
+        return False
+
+    attempt = int(st.session_state.get("bulk_poll_try", 0))
+
+    if attempt >= AUTO_REFRESH_MAX_TRIES:
+        st.session_state.pop("bulk_collecting_items", None)
+        st.session_state.pop("bulk_poll_try", None)
+        st.warning(
+            "자동 확인 시간이 끝났습니다. Actions 결과를 확인한 뒤 "
+            "데이터 다시 읽기를 눌러주세요."
+        )
+        return False
+
+    attempt += 1
+    st.session_state["bulk_poll_try"] = attempt
+
+    names = ", ".join(item["name"] for item in remaining[:5])
+    if len(remaining) > 5:
+        names += f" 외 {len(remaining) - 5}개"
+
+    st.info(
+        f"일괄 수집 중: {names} · "
+        f"남은 종목 {len(remaining)}개 · "
+        f"{AUTO_REFRESH_SECONDS}초마다 자동 확인 "
+        f"({attempt}/{AUTO_REFRESH_MAX_TRIES})"
+    )
+    st.progress(
+        min(100, int(attempt / AUTO_REFRESH_MAX_TRIES * 100))
+    )
+
+    time.sleep(AUTO_REFRESH_SECONDS)
+    st.cache_data.clear()
+    st.rerun()
+    return True
 
 
 @st.cache_data(show_spinner=False, ttl=600)
@@ -463,6 +628,88 @@ st.caption(
 history = load_history()
 financial = load_financial()
 market = load_market()
+
+with st.expander("🚀 여러 종목 일괄 자동 수집", expanded=True):
+    if market.empty:
+        st.warning("market_data.csv를 읽지 못했습니다.")
+    else:
+        bulk_text = st.text_area(
+            "종목명 또는 종목코드 여러 개 입력",
+            placeholder=(
+                "싸이맥스\n코미코\n네오셈\n"
+                "또는 싸이맥스, 코미코, 네오셈"
+            ),
+            height=150,
+            key="scanner_bulk_text",
+        )
+
+        resolved_items, unresolved_items = parse_bulk_input(
+            bulk_text,
+            market,
+        )
+
+        collected_items = [
+            item
+            for item in resolved_items
+            if is_collected(item["ticker"], history, financial)
+        ]
+        new_items = [
+            item
+            for item in resolved_items
+            if not is_collected(item["ticker"], history, financial)
+        ]
+
+        if resolved_items:
+            st.caption(
+                f"인식 {len(resolved_items)}개 · "
+                f"이미 수집 {len(collected_items)}개 · "
+                f"신규 {len(new_items)}개"
+            )
+
+        if unresolved_items:
+            st.warning(
+                "찾지 못한 입력: " + ", ".join(unresolved_items)
+            )
+
+        if len(new_items) > MAX_BULK_ITEMS:
+            st.error(
+                f"신규 종목은 한 번에 최대 {MAX_BULK_ITEMS}개까지 가능합니다. "
+                "나누어 실행해 주세요."
+            )
+
+        if auto_poll_bulk(history, financial):
+            st.stop()
+
+        if new_items and len(new_items) <= MAX_BULK_ITEMS:
+            preview = pd.DataFrame(new_items)
+            preview.columns = ["종목코드", "종목명"]
+            st.dataframe(
+                preview[["종목명", "종목코드"]],
+                hide_index=True,
+                use_container_width=True,
+            )
+
+            if st.button(
+                f"신규 {len(new_items)}개 종목 일괄 수집",
+                type="primary",
+                key="scanner_bulk_collect",
+            ):
+                ok, message = request_bulk_collection(new_items)
+
+                if ok:
+                    start_bulk_polling(new_items)
+                    st.success(
+                        message
+                        + " 종목을 한 개씩 순서대로 처리하며 자동 확인합니다."
+                    )
+                    time.sleep(2)
+                    st.rerun()
+                else:
+                    st.error(message)
+
+        elif resolved_items and not new_items:
+            st.success("입력한 종목은 모두 이미 수집되어 있습니다.")
+
 
 with st.expander("➕ 새 종목 자동 수집", expanded=True):
     if market.empty:
