@@ -1,4 +1,5 @@
 import os
+import csv
 import re
 from datetime import datetime
 
@@ -12,7 +13,7 @@ import streamlit as st
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v26.2 CSV Stable", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v27 Integrated", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -22,13 +23,14 @@ HISTORY_FILE = os.path.join(DATA_DIR, "search_history.csv")
 MARKET_DATA_CSV = os.path.join(DATA_DIR, "market_data.csv")
 FINANCIAL_DATA_CSV = os.path.join(DATA_DIR, "financial_data.csv")
 QUARTERLY_DATA_CSV = os.path.join(DATA_DIR, "financial_quarterly.csv")
+MARKET_HISTORY_CSV = os.path.join(DATA_DIR, "market_history.csv")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
 
-st.title("POR Hunting Pro v26.2 CSV Stable")
-st.caption("CSV 재무 + CSV 시가총액 + POR/PER/PBR 밴드 + 미래 POR 시뮬레이터")
+st.title("POR Hunting Pro v27 Integrated")
+st.caption("연도·분기·일별 POR/PER/PBR 밴드 + 미래 시뮬레이터")
 
 
 # =========================
@@ -259,14 +261,100 @@ def _load_quarterly_for_ticker(ticker: str, start_year: int, end_year: int) -> p
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def fetch_market_cap(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
+def fetch_market_cap(
+    ticker: str,
+    start_date: str,
+    end_date: str,
+    chart_mode: str = "분기",
+) -> pd.DataFrame:
     """
-    외부 API를 호출하지 않습니다.
-    market_data.csv의 현재 시가총액/현재가를 분기 또는 연도 시점에 배치합니다.
-    financial_quarterly.csv가 있으면 분기 단위, 없으면 연도 단위로 표시합니다.
+    차트 기준에 따라 시가총액 데이터를 구성합니다.
+
+    연도:
+      현재 시가총액/현재가를 연말 시점에 배치합니다.
+
+    분기:
+      financial_quarterly.csv의 분기말 시점에 배치합니다.
+      분기 데이터가 없으면 연도 시점으로 자동 대체합니다.
+
+    일별:
+      data/market_history.csv에서 선택 종목의 일별 주가/시가총액만
+      한 줄씩 읽어 메모리 사용을 최소화합니다.
     """
+    target = str(ticker).zfill(6)
+    start_ts = pd.to_datetime(start_date, format="%Y%m%d", errors="coerce")
+    end_ts = pd.to_datetime(end_date, format="%Y%m%d", errors="coerce")
+
+    if chart_mode == "일별":
+        columns = ["date", "market_cap", "price"]
+
+        if not os.path.exists(MARKET_HISTORY_CSV):
+            return pd.DataFrame(columns=columns)
+
+        rows = []
+
+        try:
+            with open(
+                MARKET_HISTORY_CSV,
+                "r",
+                encoding="utf-8-sig",
+                newline="",
+            ) as handle:
+                reader = csv.DictReader(handle)
+
+                required = {"ticker", "date", "price", "market_cap"}
+                if not required.issubset(set(reader.fieldnames or [])):
+                    return pd.DataFrame(columns=columns)
+
+                for item in reader:
+                    code = (
+                        str(item.get("ticker", ""))
+                        .strip()
+                        .replace(".0", "")
+                        .zfill(6)
+                    )
+
+                    if code != target:
+                        continue
+
+                    date_value = pd.to_datetime(
+                        item.get("date"),
+                        errors="coerce",
+                    )
+                    price_value = clean_num(item.get("price"))
+                    market_cap_value = clean_num(item.get("market_cap"))
+
+                    if (
+                        pd.isna(date_value)
+                        or market_cap_value is None
+                        or date_value < start_ts
+                        or date_value > end_ts
+                    ):
+                        continue
+
+                    rows.append(
+                        {
+                            "date": date_value,
+                            "market_cap": market_cap_value,
+                            "price": price_value,
+                        }
+                    )
+        except Exception:
+            return pd.DataFrame(columns=columns)
+
+        if not rows:
+            return pd.DataFrame(columns=columns)
+
+        return (
+            pd.DataFrame(rows)
+            .drop_duplicates("date", keep="last")
+            .sort_values("date")
+            .reset_index(drop=True)
+        )
+
     market = _load_market_csv()
-    row = market[market["종목코드"] == str(ticker).zfill(6)]
+    row = market[market["종목코드"] == target]
+
     if row.empty:
         return pd.DataFrame()
 
@@ -278,23 +366,40 @@ def fetch_market_cap(ticker: str, start_date: str, end_date: str) -> pd.DataFram
 
     start_year = int(start_date[:4])
     end_year = int(end_date[:4])
-
-    quarterly = _load_quarterly_for_ticker(ticker, start_year, end_year)
     dates = []
 
-    if not quarterly.empty and quarterly["period_end"].notna().any():
-        dates = quarterly["period_end"].dropna().drop_duplicates().tolist()
-    else:
+    if chart_mode == "분기":
+        quarterly = _load_quarterly_for_ticker(
+            ticker,
+            start_year,
+            end_year,
+        )
+
+        if not quarterly.empty and quarterly["period_end"].notna().any():
+            dates = (
+                quarterly["period_end"]
+                .dropna()
+                .drop_duplicates()
+                .tolist()
+            )
+
+    if not dates:
         dates = [
             pd.Timestamp(year=year, month=12, day=31)
             for year in range(start_year, end_year + 1)
         ]
 
-    return pd.DataFrame({
-        "date": dates,
-        "market_cap": [float(current_mcap_eok) * 100_000_000] * len(dates),
-        "price": [float(current_price) if current_price else None] * len(dates),
-    })
+    return pd.DataFrame(
+        {
+            "date": dates,
+            "market_cap": [
+                float(current_mcap_eok) * 100_000_000
+            ] * len(dates),
+            "price": [
+                float(current_price) if current_price else None
+            ] * len(dates),
+        }
+    )
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
@@ -599,6 +704,14 @@ with st.sidebar:
         horizontal=True,
     )
 
+    chart_mode = st.radio(
+        "차트 기준",
+        ["연도", "분기", "일별"],
+        index=2,
+        horizontal=True,
+        key="chart_mode",
+    )
+
     chart_range = st.radio(
         "차트 범위 / 평균 기준",
         ["1년", "3년", "5년", "10년", "전체"],
@@ -725,13 +838,24 @@ if run:
 
     with st.spinner("저장된 시가총액 데이터를 불러오는 중..."):
         try:
-            mcap_df = fetch_market_cap(ticker, start_date, end_date)
+            mcap_df = fetch_market_cap(
+                ticker,
+                start_date,
+                end_date,
+                chart_mode,
+            )
         except Exception as e:
             st.error(f"시가총액 수집 실패: {e}")
             st.stop()
 
     if mcap_df.empty:
-        st.error("시가총액 데이터를 가져오지 못했습니다.")
+        if chart_mode == "일별":
+            st.error(
+                f"{name}의 일별 데이터가 없습니다. "
+                "GitHub Actions에서 update_market_daily.py를 실행해 주세요."
+            )
+        else:
+            st.error("시가총액 데이터를 가져오지 못했습니다.")
         st.stop()
 
     val_df = make_valuation_df(
@@ -800,12 +924,12 @@ if run:
     c4.metric("적용 기준값", f"{latest['base_value'] / 100_000_000:,.1f}억")
     c5.metric("최근 매출액", f"{latest_revenue / 100_000_000:,.1f}억" if latest_revenue else "-")
     c6.metric("기준일", latest["date"].strftime("%Y-%m-%d"))
-    c7.metric("차트 범위", chart_range)
+    c7.metric("차트 기준", f"{chart_mode} / {chart_range}")
     c8.metric(f"예상 {valuation_metric}", f"{projected_multiple:.2f}" if projected_multiple else "-")
 
     fig, mean, std, stat_count, stat_start_date, displayed_df = plot_valuation(
         val_df,
-        f"{name} Multiple",
+        f"{name} {chart_mode} Multiple",
         valuation_metric,
         chart_range,
         projected_info,
@@ -814,7 +938,7 @@ if run:
     st.plotly_chart(
         fig,
         width="stretch",
-        key=f"{ticker}_{valuation_metric}_{chart_range}_{forward_year}_{forward_oi_eok}_{expected_mcap_eok}_{expected_price}_{projected_multiple}"
+        key=f"{ticker}_{valuation_metric}_{chart_mode}_{chart_range}_{forward_year}_{forward_oi_eok}_{expected_mcap_eok}_{expected_price}_{projected_multiple}"
     )
 
     s1, s2, s3, s4 = st.columns(4)
