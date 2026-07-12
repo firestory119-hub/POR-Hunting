@@ -16,7 +16,7 @@ import streamlit as st
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v32 Quarterly", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v31 Stable Full", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -24,12 +24,11 @@ API_KEY_FILE = os.path.join(DATA_DIR, "dart_api_key.txt")
 FAVORITES_FILE = os.path.join(DATA_DIR, "favorites.csv")
 HISTORY_FILE = os.path.join(DATA_DIR, "search_history.csv")
 FINANCIAL_CSV = os.path.join(DATA_DIR, "financial_data.csv")
-QUARTERLY_CSV = os.path.join(DATA_DIR, "financial_quarterly.csv")
 MARKET_DATA_CSV = os.path.join(DATA_DIR, "market_data.csv")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-st.title("POR Hunting Pro v32 Quarterly")
+st.title("POR Hunting Pro v31 Stable Full")
 st.caption("CSV 전용 안정판 · 기존 기능 유지 · 외부 API 미사용")
 
 
@@ -335,49 +334,6 @@ def get_current_price(ticker: str):
     value = clean_num(row.iloc[0][price_col])
     return value if value and value > 0 else None
 
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def fetch_quarterly_financials(ticker: str, years: int) -> pd.DataFrame:
-    if not os.path.exists(QUARTERLY_CSV):
-        return pd.DataFrame()
-
-    try:
-        df = pd.read_csv(QUARTERLY_CSV, dtype={"ticker": str})
-    except Exception:
-        return pd.DataFrame()
-
-    required = [
-        "ticker", "year", "quarter", "period", "period_end",
-        "revenue", "operating_income", "net_income", "equity",
-        "operating_margin", "fs_div",
-    ]
-    for col in required:
-        if col not in df.columns:
-            df[col] = None
-
-    df["ticker"] = (
-        df["ticker"].astype(str)
-        .str.replace(r"\.0$", "", regex=True)
-        .str.zfill(6)
-    )
-    df["year"] = pd.to_numeric(df["year"], errors="coerce")
-    df["quarter"] = pd.to_numeric(df["quarter"], errors="coerce")
-    df["period_end"] = pd.to_datetime(df["period_end"], errors="coerce")
-
-    for col in ["revenue", "operating_income", "net_income", "equity", "operating_margin"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    out = df[df["ticker"] == str(ticker).zfill(6)].copy()
-    if out.empty:
-        return out
-
-    min_year = int(out["year"].max()) - int(years) + 1
-    return (
-        out[out["year"] >= min_year]
-        .sort_values(["year", "quarter"])
-        .reset_index(drop=True)
-    )
 
 def make_valuation_df(
     mcap_df: pd.DataFrame,
@@ -803,8 +759,6 @@ if run:
             st.error(f"재무 데이터 읽기 실패: {e}")
             st.stop()
 
-    quarter_df = fetch_quarterly_financials(ticker, years)
-
     with st.spinner("주가/시가총액 수집 중..."):
         try:
             mcap_df = fetch_market_cap(ticker, start_date, end_date)
@@ -885,99 +839,20 @@ if run:
     c7.metric("차트 범위", chart_range)
     c8.metric(f"예상 {valuation_metric}", f"{projected_multiple:.2f}" if projected_multiple else "-")
 
-    if not quarter_df.empty:
-        q_base_col = {
-            "POR": "operating_income",
-            "PER": "net_income",
-            "PBR": "equity",
-        }[valuation_metric]
+    fig, mean, std, stat_count, stat_start_date, displayed_df = plot_valuation(
+        val_df,
+        f"{name} Multiple",
+        valuation_metric,
+        chart_range,
+        projected_info,
+    )
 
-        qplot = quarter_df.dropna(subset=[q_base_col, "period_end"]).copy()
-        qplot = qplot[qplot[q_base_col] > 0]
-        qplot["ratio"] = latest["market_cap"] / qplot[q_base_col]
-        qplot = qplot[(qplot["ratio"] > 0) & (qplot["ratio"] < 300)]
-
-        if not qplot.empty:
-            qplot["label"] = (
-                qplot["year"].astype(int).astype(str)
-                + "Q"
-                + qplot["quarter"].astype(int).astype(str)
-            )
-            mean = qplot["ratio"].mean()
-            std = qplot["ratio"].std(ddof=0)
-            stat_count = len(qplot)
-            stat_start_date = qplot["period_end"].min()
-            displayed_df = qplot.copy()
-
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=qplot["period_end"],
-                y=qplot["ratio"],
-                mode="lines+markers",
-                name=valuation_metric,
-                customdata=list(zip(
-                    qplot["label"],
-                    qplot[q_base_col] / 100_000_000,
-                    [latest["market_cap"] / 100_000_000] * len(qplot),
-                )),
-                hovertemplate=(
-                    "<b>%{customdata[0]}</b><br>"
-                    f"{valuation_metric}: " + "%{y:.2f}배<br>"
-                    "분기 기준값: %{customdata[1]:,.1f}억<br>"
-                    "현재 시가총액: %{customdata[2]:,.0f}억"
-                    "<extra></extra>"
-                ),
-            ))
-
-            for label, value in [
-                (f"평균({years}년)", mean),
-                ("+1σ", mean + std),
-                ("-1σ", mean - std),
-            ]:
-                if pd.notna(value) and value > 0:
-                    fig.add_hline(
-                        y=value,
-                        line_dash="dash",
-                        annotation_text=f"{label}: {value:.2f}",
-                        annotation_position="right",
-                    )
-
-            if projected_info is not None and projected_info.get("multiple") is not None:
-                fig.add_hline(
-                    y=projected_info["multiple"],
-                    line_dash="dot",
-                    annotation_text=(
-                        f"{projected_info['year']}E 예상 "
-                        f"{valuation_metric}: {projected_info['multiple']:.2f}"
-                    ),
-                    annotation_position="right",
-                )
-
-            fig.update_layout(
-                title=f"{name} 분기별 {valuation_metric} 비교",
-                height=650,
-                xaxis_title="분기",
-                yaxis_title=f"{valuation_metric}(배)",
-                hovermode="x unified",
-            )
-            fig.update_xaxes(tickformat="%Y-%m")
-
-            st.plotly_chart(
-                fig,
-                width="stretch",
-                key=f"quarter_{ticker}_{valuation_metric}_{years}_{forward_year}_{forward_oi_eok}",
-            )
-            st.caption("※ 분기 차트는 현재 시가총액을 각 분기 재무에 적용한 비교 차트입니다.")
-        else:
-            fig, mean, std, stat_count, stat_start_date, displayed_df = plot_valuation(
-                val_df, f"{name} Multiple", valuation_metric, chart_range, projected_info
-            )
-            st.plotly_chart(fig, width="stretch")
-    else:
-        fig, mean, std, stat_count, stat_start_date, displayed_df = plot_valuation(
-            val_df, f"{name} Multiple", valuation_metric, chart_range, projected_info
-        )
-        st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        key=f"{ticker}_{valuation_metric}_{chart_range}_{forward_year}_{forward_oi_eok}_{expected_mcap_eok}_{expected_price}_{projected_multiple}"
+    )
+    st.caption("※ 안정판 차트는 현재 시가총액을 각 연도 재무에 적용한 비교 차트입니다.")
 
     s1, s2, s3, s4 = st.columns(4)
     s1.metric(f"{chart_range} 평균 {valuation_metric}", f"{mean:.2f}")
@@ -1133,7 +1008,7 @@ if run:
                 "상승여력(%)": "{:,.1f}%",
             }, na_rep="-")
 
-            st.dataframe(styled, width="stretch", hide_index=True)
+            st.dataframe(styled, use_container_width=True, hide_index=True)
 
             st.caption("노란색=현재 POR, 파란색=선택 기간 평균 POR, 초록색=목표 POR입니다.")
         else:
@@ -1185,7 +1060,7 @@ if run:
                     "주가(원)": "{:,.0f}",
                     "상승여력(%)": "{:,.1f}%",
                 }),
-                width="stretch",
+                use_container_width=True,
                 hide_index=True,
             )
 
@@ -1219,27 +1094,6 @@ if run:
 """
             st.text_area("자동 요약", summary_text.strip(), height=180)
 
-    if not quarter_df.empty:
-        st.markdown("### 분기별 매출액 / 영업이익 / 당기순이익 / 자본총계")
-        show_q = quarter_df.copy()
-        show_q["매출액(억)"] = (show_q["revenue"] / 100_000_000).round(1)
-        show_q["영업이익(억)"] = (show_q["operating_income"] / 100_000_000).round(1)
-        show_q["당기순이익(억)"] = (show_q["net_income"] / 100_000_000).round(1)
-        show_q["자본총계(억)"] = (show_q["equity"] / 100_000_000).round(1)
-        show_q["영업이익률(%)"] = show_q["operating_margin"].round(1)
-
-        st.dataframe(
-            show_q[
-                [
-                    "period", "매출액(억)", "영업이익(억)",
-                    "당기순이익(억)", "자본총계(억)",
-                    "영업이익률(%)", "fs_div",
-                ]
-            ],
-            width="stretch",
-            hide_index=True,
-        )
-
     st.markdown("### 연도별 매출액 / 영업이익 / 당기순이익 / 자본총계")
     show_fin = fin_df.copy()
     show_fin["매출액(억)"] = (show_fin["revenue"] / 100_000_000).round(1)
@@ -1264,7 +1118,7 @@ if run:
                 "fs_div",
             ]
         ],
-        width="stretch",
+        use_container_width=True,
     )
 
     st.markdown(f"### 목표 {valuation_metric}별 시가총액 / 목표가")
@@ -1308,7 +1162,7 @@ if run:
     show_targets["목표 시가총액(억)"] = show_targets["목표 시가총액(억)"].round(1)
     show_targets["목표가(원)"] = show_targets["목표가(원)"].map(lambda x: f"{x:,.0f}" if pd.notna(x) else "-")
 
-    st.dataframe(show_targets, width="stretch")
+    st.dataframe(show_targets, use_container_width=True)
 
     with st.expander("즐겨찾기 / 최근 검색 관리", expanded=False):
         fav_manage = load_list_csv(FAVORITES_FILE, ["name", "ticker", "saved_at"])
@@ -1317,13 +1171,13 @@ if run:
         st.markdown("#### 즐겨찾기")
         st.dataframe(
             fav_manage.sort_values("saved_at", ascending=False) if not fav_manage.empty else fav_manage,
-            width="stretch",
+            use_container_width=True,
         )
 
         st.markdown("#### 최근 검색")
         st.dataframe(
             hist_manage.sort_values("searched_at", ascending=False) if not hist_manage.empty else hist_manage,
-            width="stretch",
+            use_container_width=True,
         )
 
 else:
