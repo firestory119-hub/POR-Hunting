@@ -1,4 +1,8 @@
+import json
 import os
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -17,14 +21,19 @@ HISTORY_FILE = DATA_DIR / "market_history.csv"
 FINANCIAL_FILE = DATA_DIR / "financial_data.csv"
 MARKET_FILE = DATA_DIR / "market_data.csv"
 
+GITHUB_OWNER = "firestory119-hub"
+GITHUB_REPO = "POR-Hunting"
+GITHUB_WORKFLOW = "update_one_daily.yml"
+
+AUTO_REFRESH_SECONDS = 12
+AUTO_REFRESH_MAX_TRIES = 20
+
 
 def clean_ticker(value):
     if value is None:
         return None
-
     text = str(value).strip().replace(".0", "")
     digits = "".join(ch for ch in text if ch.isdigit())
-
     return digits.zfill(6) if digits else None
 
 
@@ -35,15 +44,89 @@ def to_number(series):
     )
 
 
+def query_value(key, default=""):
+    try:
+        value = st.query_params.get(key, default)
+        if isinstance(value, list):
+            return str(value[0]) if value else default
+        return str(value)
+    except Exception:
+        return default
+
+
+def start_polling(ticker, name):
+    st.query_params["scanner_collecting"] = str(ticker).zfill(6)
+    st.query_params["scanner_collecting_name"] = str(name)
+    st.query_params["scanner_poll_try"] = "0"
+
+
+def stop_polling():
+    for key in (
+        "scanner_collecting",
+        "scanner_collecting_name",
+        "scanner_poll_try",
+    ):
+        try:
+            del st.query_params[key]
+        except Exception:
+            pass
+
+
+def request_collection(ticker, name):
+    try:
+        token = str(st.secrets["GITHUB_TOKEN"]).strip()
+    except Exception:
+        return False, "Streamlit Secrets에 GITHUB_TOKEN이 없습니다."
+
+    if not token:
+        return False, "Streamlit Secrets의 GITHUB_TOKEN이 비어 있습니다."
+
+    url = (
+        f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
+        f"/actions/workflows/{GITHUB_WORKFLOW}/dispatches"
+    )
+
+    payload = json.dumps(
+        {
+            "ref": "main",
+            "inputs": {
+                "ticker": str(ticker).zfill(6),
+                "name": str(name),
+            },
+        }
+    ).encode("utf-8")
+
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "POR-Hunting-Scanner",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            if response.status == 204:
+                return True, "수집을 요청했습니다."
+            return False, f"GitHub 응답 코드: {response.status}"
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")[:300]
+        return False, f"GitHub 요청 실패({exc.code}): {detail}"
+    except Exception as exc:
+        return False, f"GitHub 요청 실패: {exc}"
+
+
 @st.cache_data(show_spinner=False, ttl=600)
 def load_history():
     if not HISTORY_FILE.exists():
         return pd.DataFrame()
 
-    df = pd.read_csv(
-        HISTORY_FILE,
-        dtype={"ticker": str},
-    )
+    df = pd.read_csv(HISTORY_FILE, dtype={"ticker": str})
 
     rename = {}
     if "종목코드" in df.columns and "ticker" not in df.columns:
@@ -66,7 +149,6 @@ def load_history():
 
     if "name" not in df.columns:
         df["name"] = df["ticker"]
-
     if "price" not in df.columns:
         df["price"] = np.nan
 
@@ -88,10 +170,7 @@ def load_financial():
     if not FINANCIAL_FILE.exists():
         return pd.DataFrame()
 
-    df = pd.read_csv(
-        FINANCIAL_FILE,
-        dtype={"ticker": str},
-    )
+    df = pd.read_csv(FINANCIAL_FILE, dtype={"ticker": str})
 
     rename = {}
     if "종목코드" in df.columns and "ticker" not in df.columns:
@@ -112,32 +191,19 @@ def load_financial():
     if rename:
         df = df.rename(columns=rename)
 
-    required = {
-        "ticker",
-        "year",
-        "operating_income",
-        "net_income",
-        "equity",
-    }
-
+    required = {"ticker", "year", "operating_income", "net_income", "equity"}
     if not required.issubset(df.columns):
         return pd.DataFrame()
 
     if "name" not in df.columns:
         df["name"] = df["ticker"]
-
     if "revenue" not in df.columns:
         df["revenue"] = np.nan
 
     df["ticker"] = df["ticker"].map(clean_ticker)
     df["year"] = pd.to_numeric(df["year"], errors="coerce")
 
-    for column in [
-        "revenue",
-        "operating_income",
-        "net_income",
-        "equity",
-    ]:
+    for column in ["revenue", "operating_income", "net_income", "equity"]:
         df[column] = to_number(df[column])
 
     df["available_date"] = pd.to_datetime(
@@ -158,10 +224,7 @@ def load_market():
     if not MARKET_FILE.exists():
         return pd.DataFrame()
 
-    df = pd.read_csv(
-        MARKET_FILE,
-        dtype=str,
-    )
+    df = pd.read_csv(MARKET_FILE, dtype=str)
 
     rename = {}
     if "ticker" in df.columns and "종목코드" not in df.columns:
@@ -186,6 +249,61 @@ def load_market():
         df["현재시총_억원"] = to_number(df["현재시총_억원"])
 
     return df.drop_duplicates("종목코드")
+
+
+def is_collected(ticker, history, financial):
+    ticker = str(ticker).zfill(6)
+    has_history = (
+        not history.empty
+        and ticker in set(history["ticker"].dropna())
+    )
+    has_financial = (
+        not financial.empty
+        and ticker in set(financial["ticker"].dropna())
+    )
+    return has_history and has_financial
+
+
+def auto_poll(ticker, name, history, financial):
+    collecting = query_value("scanner_collecting")
+    if collecting != str(ticker).zfill(6):
+        return False
+
+    if is_collected(ticker, history, financial):
+        stop_polling()
+        st.cache_data.clear()
+        st.success(f"{name} 수집이 완료되었습니다.")
+        return False
+
+    try:
+        attempt = int(query_value("scanner_poll_try", "0"))
+    except Exception:
+        attempt = 0
+
+    if attempt >= AUTO_REFRESH_MAX_TRIES:
+        stop_polling()
+        st.warning(
+            "자동 확인 시간이 끝났습니다. Actions 결과를 확인한 뒤 "
+            "데이터 다시 읽기를 눌러주세요."
+        )
+        return False
+
+    next_attempt = attempt + 1
+    st.query_params["scanner_poll_try"] = str(next_attempt)
+
+    st.info(
+        f"{name} 데이터를 수집 중입니다. "
+        f"{AUTO_REFRESH_SECONDS}초마다 자동 확인합니다. "
+        f"({next_attempt}/{AUTO_REFRESH_MAX_TRIES})"
+    )
+    st.progress(
+        min(100, int(next_attempt / AUTO_REFRESH_MAX_TRIES * 100))
+    )
+
+    time.sleep(AUTO_REFRESH_SECONDS)
+    st.cache_data.clear()
+    st.rerun()
+    return True
 
 
 def percentile_rank(values, current_value):
@@ -233,11 +351,7 @@ def build_one_stock(ticker, history, financial):
     )
 
     previous_f = f.iloc[-2] if len(f) >= 2 else None
-    previous_op = (
-        previous_f["operating_income"]
-        if previous_f is not None
-        else np.nan
-    )
+    previous_op = previous_f["operating_income"] if previous_f is not None else np.nan
 
     op_growth = (
         (operating_income / previous_op - 1) * 100
@@ -250,12 +364,7 @@ def build_one_stock(ticker, history, financial):
     )
 
     available_fin = f[
-        [
-            "available_date",
-            "operating_income",
-            "net_income",
-            "equity",
-        ]
+        ["available_date", "operating_income", "net_income", "equity"]
     ].dropna(subset=["available_date"])
 
     daily = pd.merge_asof(
@@ -275,19 +384,11 @@ def build_one_stock(ticker, history, financial):
     ten_year_start = h["date"].max() - pd.DateOffset(years=10)
     daily_10y = daily[daily["date"] >= ten_year_start]
 
-    por_percentile = percentile_rank(
-        daily_10y["POR"],
-        current_por,
-    )
-
-    average_por = (
-        daily_10y.loc[daily_10y["POR"] > 0, "POR"].mean()
-    )
-
-    latest_name = str(latest_h.get("name", ticker))
+    por_percentile = percentile_rank(daily_10y["POR"], current_por)
+    average_por = daily_10y.loc[daily_10y["POR"] > 0, "POR"].mean()
 
     return {
-        "종목명": latest_name,
+        "종목명": str(latest_h.get("name", ticker)),
         "종목코드": ticker,
         "기준일": latest_h["date"],
         "현재가": latest_h.get("price", np.nan),
@@ -318,13 +419,8 @@ def build_scanner():
     )
 
     rows = []
-
     for ticker in tickers:
-        row = build_one_stock(
-            ticker,
-            history,
-            financial,
-        )
+        row = build_one_stock(ticker, history, financial)
         if row:
             rows.append(row)
 
@@ -334,10 +430,7 @@ def build_scanner():
         return result
 
     market = load_market()
-    if (
-        not market.empty
-        and "현재시총_억원" in market.columns
-    ):
+    if not market.empty and "현재시총_억원" in market.columns:
         market_small = market[
             ["종목코드", "종목명", "현재시총_억원"]
         ].copy()
@@ -349,19 +442,13 @@ def build_scanner():
             suffixes=("", "_시장"),
         )
 
-        result["종목명"] = result["종목명_시장"].fillna(
-            result["종목명"]
+        result["종목명"] = result["종목명_시장"].fillna(result["종목명"])
+        result["시가총액_억원"] = result["현재시총_억원"].fillna(
+            result["시가총액_억원"]
         )
 
-        result["시가총액_억원"] = result[
-            "현재시총_억원"
-        ].fillna(result["시가총액_억원"])
-
         result = result.drop(
-            columns=[
-                "종목명_시장",
-                "현재시총_억원",
-            ],
+            columns=["종목명_시장", "현재시총_억원"],
             errors="ignore",
         )
 
@@ -370,16 +457,108 @@ def build_scanner():
 
 st.title("🔎 POR Scanner")
 st.caption(
-    "현재 수집된 종목 가운데 역사적 저평가 구간과 "
-    "기본 밸류 조건을 동시에 만족하는 후보를 찾습니다."
+    "수집 종목을 스캔하고, 아직 수집되지 않은 종목은 이 화면에서 바로 추가합니다."
 )
+
+history = load_history()
+financial = load_financial()
+market = load_market()
+
+with st.expander("➕ 새 종목 자동 수집", expanded=True):
+    if market.empty:
+        st.warning("market_data.csv를 읽지 못했습니다.")
+    else:
+        collecting_name = query_value("scanner_collecting_name", "")
+        search_text = st.text_input(
+            "종목명 또는 종목코드",
+            value=collecting_name,
+            placeholder="예: 싸이맥스 또는 160980",
+            key="scanner_stock_search",
+        )
+
+        filtered_market = market.copy()
+
+        if search_text.strip():
+            keyword = search_text.strip().lower()
+            filtered_market = filtered_market[
+                filtered_market["종목명"].astype(str).str.lower().str.contains(
+                    keyword, na=False
+                )
+                | filtered_market["종목코드"].astype(str).str.contains(
+                    keyword, na=False
+                )
+            ]
+
+        options = [
+            f"{row['종목명']} ({row['종목코드']})"
+            for _, row in filtered_market.head(100).iterrows()
+        ]
+
+        if options:
+            selected = st.selectbox(
+                "종목 선택",
+                options,
+                key="scanner_stock_select",
+            )
+
+            selected_name = selected.rsplit(" (", 1)[0]
+            selected_ticker = selected.rsplit("(", 1)[1].rstrip(")")
+
+            collected = is_collected(
+                selected_ticker,
+                history,
+                financial,
+            )
+
+            if auto_poll(
+                selected_ticker,
+                selected_name,
+                history,
+                financial,
+            ):
+                st.stop()
+
+            if collected:
+                st.success(
+                    f"{selected_name}은 이미 일별·재무 데이터가 수집되어 있습니다."
+                )
+            else:
+                st.warning(
+                    f"{selected_name}은 아직 스캐너 대상에 없습니다."
+                )
+
+                if st.button(
+                    "이 종목 일별·재무 데이터 자동 수집",
+                    type="primary",
+                    key=f"scanner_collect_{selected_ticker}",
+                ):
+                    ok, message = request_collection(
+                        selected_ticker,
+                        selected_name,
+                    )
+
+                    if ok:
+                        start_polling(
+                            selected_ticker,
+                            selected_name,
+                        )
+                        st.success(
+                            message
+                            + " 완료될 때까지 자동으로 새로고침합니다."
+                        )
+                        time.sleep(2)
+                        st.rerun()
+                    else:
+                        st.error(message)
+        else:
+            st.info("검색 결과가 없습니다.")
 
 scanner = build_scanner()
 
 if scanner.empty:
     st.error(
         "스캐너 데이터가 없습니다. "
-        "market_history.csv와 financial_data.csv를 확인하세요."
+        "위 자동 수집에서 종목을 먼저 추가하세요."
     )
     st.stop()
 
@@ -388,11 +567,10 @@ with st.sidebar:
 
     max_por_percentile = st.slider(
         "POR 백분위 상한",
-        min_value=1,
-        max_value=100,
-        value=30,
-        step=1,
-        help="낮을수록 역사적으로 싼 구간입니다.",
+        1,
+        100,
+        30,
+        1,
     )
 
     max_por = st.number_input(
@@ -441,12 +619,10 @@ with st.sidebar:
         value=True,
     )
 
-    refresh = st.button(
+    if st.button(
         "데이터 다시 읽기",
         use_container_width=True,
-    )
-
-    if refresh:
+    ):
         st.cache_data.clear()
         st.rerun()
 
@@ -480,19 +656,15 @@ c1.metric("수집 종목", f"{len(scanner):,}개")
 c2.metric("조건 통과", f"{len(filtered):,}개")
 c3.metric(
     "중앙 POR 백분위",
-    (
-        f"{filtered['POR백분위'].median():.1f}%"
-        if not filtered.empty
-        else "-"
-    ),
+    f"{filtered['POR백분위'].median():.1f}%"
+    if not filtered.empty
+    else "-",
 )
 c4.metric(
     "중앙 영업이익 증가율",
-    (
-        f"{filtered['영업이익증가율'].median():.1f}%"
-        if not filtered.empty
-        else "-"
-    ),
+    f"{filtered['영업이익증가율'].median():.1f}%"
+    if not filtered.empty
+    else "-",
 )
 
 st.subheader("조건 통과 종목")
@@ -500,16 +672,15 @@ st.subheader("조건 통과 종목")
 if filtered.empty:
     st.info(
         "현재 조건을 만족하는 종목이 없습니다. "
-        "사이드바 조건을 조금 완화해 보세요."
+        "사이드바 조건을 완화해 보세요."
     )
 else:
     display = filtered.copy()
-
     display["기준일"] = pd.to_datetime(
         display["기준일"]
     ).dt.strftime("%Y-%m-%d")
 
-    for column in [
+    numeric_columns = [
         "현재가",
         "시가총액_억원",
         "현재POR",
@@ -519,7 +690,9 @@ else:
         "POR백분위",
         "최근영업이익_억원",
         "영업이익증가율",
-    ]:
+    ]
+
+    for column in numeric_columns:
         display[column] = pd.to_numeric(
             display[column],
             errors="coerce",
@@ -557,18 +730,6 @@ else:
                 "영업이익 증가율",
                 format="%.1f%%",
             ),
-            "현재POR": st.column_config.NumberColumn(
-                "현재 POR",
-                format="%.2f",
-            ),
-            "현재PER": st.column_config.NumberColumn(
-                "현재 PER",
-                format="%.2f",
-            ),
-            "현재PBR": st.column_config.NumberColumn(
-                "현재 PBR",
-                format="%.2f",
-            ),
         },
     )
 
@@ -582,16 +743,4 @@ else:
         data=csv_data,
         file_name="por_scanner_result.csv",
         mime="text/csv",
-    )
-
-with st.expander("계산 기준"):
-    st.markdown(
-        """
-- **현재 POR** = 최신 시가총액 ÷ 최신 연간 영업이익
-- **현재 PER** = 최신 시가총액 ÷ 최신 연간 순이익
-- **현재 PBR** = 최신 시가총액 ÷ 최신 자본총계
-- **POR 백분위**는 최근 10년 일별 POR 중 현재 값 이하의 비율입니다.
-- 연간 재무정보는 다음 해 4월 1일부터 시장에 반영된 것으로 간주해 과거 데이터에 연결합니다.
-- 스캐너는 현재 `market_history.csv`와 `financial_data.csv`에 모두 존재하는 종목만 대상으로 합니다.
-        """
     )
