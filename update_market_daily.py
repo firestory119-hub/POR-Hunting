@@ -6,21 +6,29 @@ from datetime import datetime, timedelta
 import pandas as pd
 import FinanceDataReader as fdr
 
+
 DATA_DIR = "data"
 MARKET_FILE = os.path.join(DATA_DIR, "market_data.csv")
 FINANCIAL_FILE = os.path.join(DATA_DIR, "financial_data.csv")
-HISTORY_FILE = os.path.join(DATA_DIR, "market_history.csv")
+FAVORITES_FILE = os.path.join(DATA_DIR, "favorites.csv")
+SEARCH_HISTORY_FILE = os.path.join(DATA_DIR, "search_history.csv")
+OUTPUT_FILE = os.path.join(DATA_DIR, "market_history.csv")
+
 YEARS = 10
+SLEEP_SECONDS = 0.3
 
 
 def clean_num(value):
     if value is None:
         return None
-    s = str(value).replace(",", "").replace(" ", "").strip()
-    if s in {"", "-", "nan", "None"}:
+
+    text = str(value).replace(",", "").replace(" ", "").strip()
+
+    if text in {"", "-", "None", "nan"}:
         return None
+
     try:
-        return float(s)
+        return float(text)
     except Exception:
         return None
 
@@ -28,122 +36,355 @@ def clean_num(value):
 def clean_ticker(value):
     if value is None:
         return None
-    digits = "".join(ch for ch in str(value).replace(".0", "") if ch.isdigit())
+
+    text = str(value).strip().replace(".0", "")
+    digits = "".join(ch for ch in text if ch.isdigit())
+
     return digits.zfill(6) if digits else None
 
 
-def load_market():
-    df = pd.read_csv(MARKET_FILE, dtype=str)
-    rename = {}
-    if "ticker" in df.columns and "종목코드" not in df.columns:
-        rename["ticker"] = "종목코드"
-    if "name" in df.columns and "종목명" not in df.columns:
-        rename["name"] = "종목명"
-    if "price" in df.columns and "현재가" not in df.columns:
-        rename["price"] = "현재가"
-    if "market_cap_eok" in df.columns and "현재시총_억원" not in df.columns:
-        rename["market_cap_eok"] = "현재시총_억원"
-    if rename:
-        df = df.rename(columns=rename)
+def load_market_data():
+    if not os.path.exists(MARKET_FILE):
+        raise RuntimeError("data/market_data.csv가 없습니다.")
 
-    df["종목코드"] = df["종목코드"].map(clean_ticker)
-    for col in ["현재가", "현재시총_억원", "상장주식수"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
+    market = pd.read_csv(MARKET_FILE, dtype=str)
+
+    rename_map = {}
+
+    if "ticker" in market.columns and "종목코드" not in market.columns:
+        rename_map["ticker"] = "종목코드"
+
+    if "name" in market.columns and "종목명" not in market.columns:
+        rename_map["name"] = "종목명"
+
+    if "price" in market.columns and "현재가" not in market.columns:
+        rename_map["price"] = "현재가"
+
+    if "market_cap_eok" in market.columns and "현재시총_억원" not in market.columns:
+        rename_map["market_cap_eok"] = "현재시총_억원"
+
+    if rename_map:
+        market = market.rename(columns=rename_map)
+
+    required = {"종목코드", "종목명"}
+
+    if not required.issubset(market.columns):
+        raise RuntimeError("market_data.csv에 종목코드/종목명 열이 없습니다.")
+
+    market["종목코드"] = market["종목코드"].map(clean_ticker)
+
+    for column in ["현재가", "현재시총_억원", "상장주식수", "시가총액"]:
+        if column in market.columns:
+            market[column] = pd.to_numeric(market[column], errors="coerce")
+
+    if "현재시총_억원" not in market.columns and "시가총액" in market.columns:
+        market["현재시총_억원"] = market["시가총액"] / 100_000_000
+
+    return market.dropna(subset=["종목코드"]).drop_duplicates("종목코드")
+
+
+def read_target_file(path):
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=["ticker", "name"])
+
+    try:
+        data = pd.read_csv(path, dtype=str)
+    except Exception:
+        return pd.DataFrame(columns=["ticker", "name"])
+
+    if {"ticker", "name"}.issubset(data.columns):
+        result = data[["ticker", "name"]].copy()
+    elif {"종목코드", "종목명"}.issubset(data.columns):
+        result = data[["종목코드", "종목명"]].copy()
+        result.columns = ["ticker", "name"]
+    else:
+        return pd.DataFrame(columns=["ticker", "name"])
+
+    result["ticker"] = result["ticker"].map(clean_ticker)
+    result["name"] = result["name"].astype(str).str.strip()
+
+    return result.dropna(subset=["ticker"])
 
 
 def load_targets(market):
-    targets = []
-    if os.path.exists(FINANCIAL_FILE):
-        fin = pd.read_csv(FINANCIAL_FILE, dtype=str)
-        if {"ticker", "name"}.issubset(fin.columns):
-            targets.append(fin[["ticker", "name"]])
+    frames = []
 
-    for filename in ["favorites.csv", "search_history.csv"]:
-        path = os.path.join(DATA_DIR, filename)
-        if os.path.exists(path):
-            df = pd.read_csv(path, dtype=str)
-            if {"ticker", "name"}.issubset(df.columns):
-                targets.append(df[["ticker", "name"]])
+    # 앱에서 실제 조회 가능한 종목 목록
+    for path in [
+        FINANCIAL_FILE,
+        FAVORITES_FILE,
+        SEARCH_HISTORY_FILE,
+    ]:
+        target = read_target_file(path)
 
-    if not targets:
+        if not target.empty:
+            frames.append(target)
+
+    if not frames:
         fallback = market[["종목코드", "종목명"]].head(20).copy()
         fallback.columns = ["ticker", "name"]
-        targets.append(fallback)
+        frames.append(fallback)
 
-    out = pd.concat(targets, ignore_index=True)
-    out["ticker"] = out["ticker"].map(clean_ticker)
-    return out.dropna(subset=["ticker"]).drop_duplicates("ticker").reset_index(drop=True)
+    targets = pd.concat(frames, ignore_index=True)
+    targets["ticker"] = targets["ticker"].map(clean_ticker)
+    targets["name"] = targets["name"].astype(str).str.strip()
+
+    targets = (
+        targets.dropna(subset=["ticker"])
+        .drop_duplicates("ticker", keep="last")
+        .reset_index(drop=True)
+    )
+
+    return targets
 
 
 def infer_shares(row):
-    shares = clean_num(row.get("상장주식수"))
-    if shares and shares > 0:
-        return shares
+    listed_shares = clean_num(row.get("상장주식수"))
 
-    price = clean_num(row.get("현재가"))
-    mcap_eok = clean_num(row.get("현재시총_억원"))
-    if price and mcap_eok:
-        return mcap_eok * 100_000_000 / price
+    if listed_shares and listed_shares > 0:
+        return listed_shares
+
+    current_price = clean_num(row.get("현재가"))
+    current_market_cap_eok = clean_num(row.get("현재시총_억원"))
+
+    if (
+        current_price
+        and current_price > 0
+        and current_market_cap_eok
+        and current_market_cap_eok > 0
+    ):
+        return current_market_cap_eok * 100_000_000 / current_price
+
     return None
+
+
+def read_existing_history():
+    if not os.path.exists(OUTPUT_FILE):
+        return pd.DataFrame()
+
+    try:
+        existing = pd.read_csv(
+            OUTPUT_FILE,
+            dtype={"ticker": str},
+            parse_dates=["date"],
+        )
+    except Exception:
+        return pd.DataFrame()
+
+    if existing.empty:
+        return existing
+
+    existing["ticker"] = existing["ticker"].map(clean_ticker)
+
+    return existing
+
+
+def fetch_daily_price(ticker, start_date, end_date):
+    attempts = 3
+
+    for attempt in range(1, attempts + 1):
+        try:
+            data = fdr.DataReader(
+                ticker,
+                start_date.strftime("%Y-%m-%d"),
+                end_date.strftime("%Y-%m-%d"),
+            )
+
+            if data is None or data.empty:
+                return pd.DataFrame()
+
+            return data
+
+        except Exception as exc:
+            print(
+                f"  - 주가 수집 재시도 {attempt}/{attempts}: {exc}",
+                flush=True,
+            )
+
+            if attempt < attempts:
+                time.sleep(attempt * 2)
+
+    return pd.DataFrame()
+
+
+def normalize_price_data(price_data, name, ticker, shares):
+    if price_data is None or price_data.empty:
+        return pd.DataFrame()
+
+    price_data = price_data.reset_index()
+
+    date_column = price_data.columns[0]
+
+    if "Close" in price_data.columns:
+        close_column = "Close"
+    elif "종가" in price_data.columns:
+        close_column = "종가"
+    else:
+        return pd.DataFrame()
+
+    result = pd.DataFrame(
+        {
+            "name": name,
+            "ticker": ticker,
+            "date": pd.to_datetime(
+                price_data[date_column],
+                errors="coerce",
+            ),
+            "price": pd.to_numeric(
+                price_data[close_column],
+                errors="coerce",
+            ),
+        }
+    )
+
+    result = result.dropna(subset=["date", "price"])
+    result = result[result["price"] > 0]
+
+    if result.empty:
+        return result
+
+    result["shares"] = float(shares)
+    result["market_cap"] = result["price"] * result["shares"]
+
+    return result[
+        [
+            "name",
+            "ticker",
+            "date",
+            "price",
+            "shares",
+            "market_cap",
+        ]
+    ]
 
 
 def main():
     print("=== 일별 시가총액 업데이트 시작 ===", flush=True)
-    market = load_market()
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    market = load_market_data()
     targets = load_targets(market)
-    print(f"수집 대상: {len(targets):,}개", flush=True)
+    existing = read_existing_history()
 
-    end = datetime.today()
-    start = end - timedelta(days=365 * YEARS + 30)
-    rows = []
+    print(f"수집 대상: {len(targets):,}개 종목", flush=True)
 
-    for idx, target in targets.iterrows():
+    today = datetime.today()
+    default_start = today - timedelta(days=365 * YEARS + 60)
+
+    collected = []
+
+    for index, target in targets.iterrows():
         ticker = target["ticker"]
         name = target["name"]
-        print(f"[{idx+1}/{len(targets)}] {name} ({ticker})", flush=True)
 
-        mrow = market[market["종목코드"] == ticker]
-        if mrow.empty:
+        print(
+            f"[{index + 1}/{len(targets)}] {name} ({ticker})",
+            flush=True,
+        )
+
+        market_row = market[market["종목코드"] == ticker]
+
+        if market_row.empty:
+            print("  - market_data.csv에 종목 없음", flush=True)
             continue
-        shares = infer_shares(mrow.iloc[0])
-        if not shares:
+
+        shares = infer_shares(market_row.iloc[0])
+
+        if not shares or shares <= 0:
             print("  - 상장주식수 계산 불가", flush=True)
             continue
 
-        try:
-            price = fdr.DataReader(ticker, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
-        except Exception as exc:
-            print(f"  - 주가 수집 실패: {exc}", flush=True)
+        start_date = default_start
+
+        if not existing.empty:
+            old = existing[existing["ticker"] == ticker]
+
+            if not old.empty:
+                last_date = pd.to_datetime(old["date"], errors="coerce").max()
+
+                if pd.notna(last_date):
+                    start_date = max(
+                        default_start,
+                        last_date.to_pydatetime() - timedelta(days=7),
+                    )
+
+        price_data = fetch_daily_price(
+            ticker,
+            start_date,
+            today,
+        )
+
+        normalized = normalize_price_data(
+            price_data,
+            name,
+            ticker,
+            shares,
+        )
+
+        if normalized.empty:
+            print("  - 일별 주가 데이터 없음", flush=True)
             continue
 
-        if price is None or price.empty:
-            continue
+        collected.append(normalized)
 
-        price = price.reset_index()
-        date_col = price.columns[0]
-        close_col = "Close" if "Close" in price.columns else ("종가" if "종가" in price.columns else None)
-        if close_col is None:
-            continue
+        print(
+            f"  - {len(normalized):,}일 수집",
+            flush=True,
+        )
 
-        one = pd.DataFrame({
-            "name": name,
-            "ticker": ticker,
-            "date": pd.to_datetime(price[date_col], errors="coerce"),
-            "price": pd.to_numeric(price[close_col], errors="coerce"),
-        }).dropna(subset=["date", "price"])
-        one["shares"] = float(shares)
-        one["market_cap"] = one["price"] * one["shares"]
-        rows.append(one)
-        time.sleep(0.3)
+        time.sleep(SLEEP_SECONDS)
 
-    if not rows:
-        raise RuntimeError("일별 주가 데이터를 수집하지 못했습니다.")
+    if not collected and existing.empty:
+        raise RuntimeError("일별 주가 데이터를 한 건도 수집하지 못했습니다.")
 
-    result = pd.concat(rows, ignore_index=True).sort_values(["ticker", "date"])
-    result.to_csv(HISTORY_FILE, index=False, encoding="utf-8-sig")
-    print(f"market_history.csv 완료: {len(result):,}행", flush=True)
+    frames = []
+
+    if not existing.empty:
+        frames.append(existing)
+
+    if collected:
+        frames.extend(collected)
+
+    result = pd.concat(frames, ignore_index=True)
+
+    result["ticker"] = result["ticker"].map(clean_ticker)
+    result["date"] = pd.to_datetime(result["date"], errors="coerce")
+    result["price"] = pd.to_numeric(result["price"], errors="coerce")
+    result["shares"] = pd.to_numeric(result["shares"], errors="coerce")
+    result["market_cap"] = pd.to_numeric(
+        result["market_cap"],
+        errors="coerce",
+    )
+
+    result = (
+        result.dropna(
+            subset=[
+                "ticker",
+                "date",
+                "price",
+                "market_cap",
+            ]
+        )
+        .drop_duplicates(
+            subset=["ticker", "date"],
+            keep="last",
+        )
+        .sort_values(["ticker", "date"])
+        .reset_index(drop=True)
+    )
+
+    result.to_csv(
+        OUTPUT_FILE,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    print(
+        f"market_history.csv 완료: {len(result):,}행",
+        flush=True,
+    )
+    print("=== 일별 시가총액 업데이트 완료 ===", flush=True)
 
 
 if __name__ == "__main__":
