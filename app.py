@@ -4,6 +4,7 @@ import json
 import urllib.request
 import urllib.error
 import re
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -16,7 +17,7 @@ import streamlit as st
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v27 Auto Daily", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v27 Auto Refresh", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -30,12 +31,14 @@ MARKET_HISTORY_CSV = os.path.join(DATA_DIR, "market_history.csv")
 GITHUB_OWNER = "firestory119-hub"
 GITHUB_REPO = "POR-Hunting"
 GITHUB_WORKFLOW = "update_one_daily.yml"
+AUTO_REFRESH_SECONDS = 12
+AUTO_REFRESH_MAX_TRIES = 20
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
 
-st.title("POR Hunting Pro v27 Auto Daily")
+st.title("POR Hunting Pro v27 Auto Refresh")
 st.caption("연도·분기·일별 밴드 + 종목별 자동 일별 수집")
 
 
@@ -471,6 +474,77 @@ def request_daily_collection(ticker: str, name: str) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"GitHub 요청 실패: {exc}"
 
+
+def _query_value(key: str, default: str = "") -> str:
+    try:
+        value = st.query_params.get(key, default)
+        if isinstance(value, list):
+            return str(value[0]) if value else default
+        return str(value)
+    except Exception:
+        return default
+
+
+def start_auto_collection(ticker: str, name: str):
+    st.query_params["collecting"] = str(ticker).zfill(6)
+    st.query_params["collecting_name"] = str(name)
+    st.query_params["poll_try"] = "0"
+
+
+def stop_auto_collection():
+    for key in ("collecting", "collecting_name", "poll_try"):
+        try:
+            del st.query_params[key]
+        except Exception:
+            pass
+
+
+def auto_poll_collection(ticker: str, name: str):
+    collecting = _query_value("collecting")
+    if collecting != str(ticker).zfill(6):
+        return False
+
+    try:
+        attempt = int(_query_value("poll_try", "0"))
+    except Exception:
+        attempt = 0
+
+    if attempt >= AUTO_REFRESH_MAX_TRIES:
+        st.warning(
+            "자동 확인 시간이 끝났습니다. GitHub Actions 결과를 확인한 뒤 "
+            "새로고침해 주세요."
+        )
+        stop_auto_collection()
+        return False
+
+    next_attempt = attempt + 1
+    st.query_params["poll_try"] = str(next_attempt)
+
+    remaining = AUTO_REFRESH_MAX_TRIES - next_attempt
+    st.info(
+        f"{name} 데이터를 수집 중입니다. "
+        f"{AUTO_REFRESH_SECONDS}초마다 자동 확인합니다. "
+        f"(확인 {next_attempt}/{AUTO_REFRESH_MAX_TRIES}, 남은 {remaining}회)"
+    )
+
+    progress = min(
+        100,
+        int(next_attempt / AUTO_REFRESH_MAX_TRIES * 100),
+    )
+    st.progress(progress)
+
+    time.sleep(AUTO_REFRESH_SECONDS)
+
+    try:
+        fetch_market_cap.clear()
+        fetch_financials.clear()
+        _load_market_csv.clear()
+    except Exception:
+        pass
+
+    st.rerun()
+    return True
+
 def make_valuation_df(
     mcap_df: pd.DataFrame,
     fin_df: pd.DataFrame,
@@ -810,7 +884,7 @@ with st.sidebar:
 # =========================
 # 메인 화면
 # =========================
-default_query = "삼성전자"
+default_query = _query_value("collecting_name", "삼성전자")
 try:
     if selected_quick != "직접 입력":
         default_query = quick_map.get(selected_quick, "삼성전자")
@@ -910,22 +984,29 @@ if run:
         if chart_mode == "일별":
             st.warning(f"{name}의 일별 데이터가 아직 없습니다.")
 
+            if auto_poll_collection(ticker, name):
+                st.stop()
+
             if st.button(
-                "이 종목 일별 데이터 수집 요청",
+                "이 종목 일별·재무 데이터 수집 요청",
                 type="primary",
                 key=f"request_daily_{ticker}",
             ):
                 ok, message = request_daily_collection(ticker, name)
                 if ok:
+                    start_auto_collection(ticker, name)
                     st.success(
                         message
-                        + " 보통 1~3분 뒤 새로고침하면 일별 차트를 볼 수 있습니다."
+                        + " 이제 화면이 자동으로 새로고침되며 완료 여부를 확인합니다."
                     )
+                    time.sleep(2)
+                    st.rerun()
                 else:
                     st.error(message)
 
             st.caption(
-                "한 번 수집된 종목은 이후 GitHub Actions에서 기존 데이터 뒤를 이어 갱신됩니다."
+                "버튼은 종목별 최초 1회만 누르면 됩니다. "
+                "GitHub Actions 완료 후 차트가 자동으로 표시됩니다."
             )
         else:
             st.error("시가총액 데이터를 가져오지 못했습니다.")
@@ -940,9 +1021,44 @@ if run:
     )
 
     if val_df.empty:
-        st.error("밴드 계산이 불가능합니다. 선택 지표의 기준값이 없거나 적자/마이너스일 수 있습니다.")
-        st.dataframe(fin_df)
+        if chart_mode == "일별":
+            st.warning(
+                f"{name}의 재무 데이터가 아직 없거나 "
+                f"{valuation_metric} 계산 기준값이 준비되지 않았습니다."
+            )
+
+            if auto_poll_collection(ticker, name):
+                st.stop()
+
+            if fin_df.empty and st.button(
+                "이 종목 일별·재무 데이터 수집 요청",
+                type="primary",
+                key=f"request_financial_{ticker}",
+            ):
+                ok, message = request_daily_collection(ticker, name)
+                if ok:
+                    start_auto_collection(ticker, name)
+                    st.success(
+                        message
+                        + " 완료될 때까지 자동으로 확인합니다."
+                    )
+                    time.sleep(2)
+                    st.rerun()
+                else:
+                    st.error(message)
+        else:
+            st.error(
+                "밴드 계산이 불가능합니다. 선택 지표의 기준값이 없거나 "
+                "적자/마이너스일 수 있습니다."
+            )
+
+        if not fin_df.empty:
+            st.dataframe(fin_df)
         st.stop()
+
+    if _query_value("collecting") == str(ticker).zfill(6):
+        stop_auto_collection()
+        st.success(f"{name} 데이터 수집이 완료되었습니다.")
 
     # v17.3: 미래 예상 POR 계산용 정보
     projected_info = None
