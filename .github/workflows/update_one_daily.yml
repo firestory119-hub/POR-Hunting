@@ -33,7 +33,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas==2.2.3 requests finance-datareader
+          pip install pandas==2.2.3 requests FinanceDataReader
 
       - name: Update and commit
         env:
@@ -44,34 +44,17 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          for attempt in 1 2 3
-          do
-            echo "저장 시도: $attempt/3"
+          git fetch origin main
+          git reset --hard origin/main
 
-            git fetch origin main
-            git reset --hard origin/main
+          python update_market_daily.py
 
-            python update_market_daily.py
+          git add data/market_history.csv data/financial_data.csv data/corp_codes.csv
 
-            git add data/market_history.csv
-            git add data/financial_data.csv
-            git add data/corp_codes.csv
+          if git diff --cached --quiet; then
+            echo "No changes."
+            exit 0
+          fi
 
-            if git diff --cached --quiet; then
-              echo "변경된 데이터가 없습니다."
-              exit 0
-            fi
-
-            git commit -m "Update daily and financial data for ${INPUT_NAME} (${INPUT_TICKER})"
-
-            if git push origin HEAD:main; then
-              echo "저장 성공"
-              exit 0
-            fi
-
-            echo "충돌 발생. 5초 후 재시도..."
-            sleep 5
-          done
-
-          echo "3회 재시도 후에도 저장 실패"
-          exit 1
+          git commit -m "Update ${INPUT_NAME} (${INPUT_TICKER})"
+          git push origin HEAD:main
