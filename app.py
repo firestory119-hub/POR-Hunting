@@ -964,7 +964,7 @@ if run:
 
             st.plotly_chart(
                 fig,
-                use_container_width=True,
+                width="stretch",
                 key=f"quarter_{ticker}_{valuation_metric}_{years}_{forward_year}_{forward_oi_eok}",
             )
             st.caption("※ 분기 차트는 현재 시가총액을 각 분기 재무에 적용한 비교 차트입니다.")
@@ -972,12 +972,12 @@ if run:
             fig, mean, std, stat_count, stat_start_date, displayed_df = plot_valuation(
                 val_df, f"{name} Multiple", valuation_metric, chart_range, projected_info
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
     else:
         fig, mean, std, stat_count, stat_start_date, displayed_df = plot_valuation(
             val_df, f"{name} Multiple", valuation_metric, chart_range, projected_info
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     s1, s2, s3, s4 = st.columns(4)
     s1.metric(f"{chart_range} 평균 {valuation_metric}", f"{mean:.2f}")
@@ -1133,7 +1133,7 @@ if run:
                 "상승여력(%)": "{:,.1f}%",
             }, na_rep="-")
 
-            st.dataframe(styled, use_container_width=True, hide_index=True)
+            st.dataframe(styled, width="stretch", hide_index=True)
 
             st.caption("노란색=현재 POR, 파란색=선택 기간 평균 POR, 초록색=목표 POR입니다.")
         else:
@@ -1185,7 +1185,7 @@ if run:
                     "주가(원)": "{:,.0f}",
                     "상승여력(%)": "{:,.1f}%",
                 }),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -1236,7 +1236,7 @@ if run:
                     "영업이익률(%)", "fs_div",
                 ]
             ],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -1264,7 +1264,7 @@ if run:
                 "fs_div",
             ]
         ],
-        use_container_width=True,
+        width="stretch",
     )
 
     st.markdown(f"### 목표 {valuation_metric}별 시가총액 / 목표가")
@@ -1308,7 +1308,7 @@ if run:
     show_targets["목표 시가총액(억)"] = show_targets["목표 시가총액(억)"].round(1)
     show_targets["목표가(원)"] = show_targets["목표가(원)"].map(lambda x: f"{x:,.0f}" if pd.notna(x) else "-")
 
-    st.dataframe(show_targets, use_container_width=True)
+    st.dataframe(show_targets, width="stretch")
 
     with st.expander("즐겨찾기 / 최근 검색 관리", expanded=False):
         fav_manage = load_list_csv(FAVORITES_FILE, ["name", "ticker", "saved_at"])
@@ -1317,13 +1317,13 @@ if run:
         st.markdown("#### 즐겨찾기")
         st.dataframe(
             fav_manage.sort_values("saved_at", ascending=False) if not fav_manage.empty else fav_manage,
-            use_container_width=True,
+            width="stretch",
         )
 
         st.markdown("#### 최근 검색")
         st.dataframe(
             hist_manage.sort_values("searched_at", ascending=False) if not hist_manage.empty else hist_manage,
-            use_container_width=True,
+            width="stretch",
         )
 
 else:
