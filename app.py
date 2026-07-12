@@ -12,7 +12,7 @@ import streamlit as st
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v26.2 CSV Stable", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v26.3 Daily Stable", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -22,12 +22,13 @@ HISTORY_FILE = os.path.join(DATA_DIR, "search_history.csv")
 MARKET_DATA_CSV = os.path.join(DATA_DIR, "market_data.csv")
 FINANCIAL_DATA_CSV = os.path.join(DATA_DIR, "financial_data.csv")
 QUARTERLY_DATA_CSV = os.path.join(DATA_DIR, "financial_quarterly.csv")
+MARKET_HISTORY_CSV = os.path.join(DATA_DIR, "market_history.csv")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
 
-st.title("POR Hunting Pro v26.2 CSV Stable")
+st.title("POR Hunting Pro v26.3 Daily Stable")
 st.caption("CSV 재무 + CSV 시가총액 + POR/PER/PBR 밴드 + 미래 POR 시뮬레이터")
 
 
@@ -261,40 +262,66 @@ def _load_quarterly_for_ticker(ticker: str, start_year: int, end_year: int) -> p
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_market_cap(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
     """
-    외부 API를 호출하지 않습니다.
-    market_data.csv의 현재 시가총액/현재가를 분기 또는 연도 시점에 배치합니다.
-    financial_quarterly.csv가 있으면 분기 단위, 없으면 연도 단위로 표시합니다.
+    data/market_history.csv에서 해당 종목의 일별 주가·시가총액만 읽습니다.
+    큰 CSV 전체를 한 번에 메모리에 올리지 않고 chunksize로 나눠 읽어
+    Streamlit Cloud 메모리 오류를 방지합니다.
     """
-    market = _load_market_csv()
-    row = market[market["종목코드"] == str(ticker).zfill(6)]
-    if row.empty:
-        return pd.DataFrame()
+    if not os.path.exists(MARKET_HISTORY_CSV):
+        raise RuntimeError(
+            "data/market_history.csv가 없습니다. "
+            "GitHub Actions의 일별 업데이트를 먼저 실행하세요."
+        )
 
-    current_price = clean_num(row.iloc[0].get("현재가"))
-    current_mcap_eok = clean_num(row.iloc[0].get("현재시총_억원"))
+    target = str(ticker).zfill(6)
+    start = pd.to_datetime(start_date, format="%Y%m%d", errors="coerce")
+    end = pd.to_datetime(end_date, format="%Y%m%d", errors="coerce")
 
-    if not current_mcap_eok or current_mcap_eok <= 0:
-        return pd.DataFrame()
+    parts = []
+    usecols = ["ticker", "date", "price", "market_cap"]
 
-    start_year = int(start_date[:4])
-    end_year = int(end_date[:4])
+    try:
+        reader = pd.read_csv(
+            MARKET_HISTORY_CSV,
+            dtype={"ticker": str},
+            usecols=usecols,
+            chunksize=50000,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"market_history.csv 읽기 실패: {exc}") from exc
 
-    quarterly = _load_quarterly_for_ticker(ticker, start_year, end_year)
-    dates = []
+    for chunk in reader:
+        chunk["ticker"] = (
+            chunk["ticker"].astype(str)
+            .str.replace(r"\.0$", "", regex=True)
+            .str.zfill(6)
+        )
 
-    if not quarterly.empty and quarterly["period_end"].notna().any():
-        dates = quarterly["period_end"].dropna().drop_duplicates().tolist()
-    else:
-        dates = [
-            pd.Timestamp(year=year, month=12, day=31)
-            for year in range(start_year, end_year + 1)
-        ]
+        chunk = chunk[chunk["ticker"] == target].copy()
+        if chunk.empty:
+            continue
 
-    return pd.DataFrame({
-        "date": dates,
-        "market_cap": [float(current_mcap_eok) * 100_000_000] * len(dates),
-        "price": [float(current_price) if current_price else None] * len(dates),
-    })
+        chunk["date"] = pd.to_datetime(chunk["date"], errors="coerce")
+        chunk["price"] = pd.to_numeric(chunk["price"], errors="coerce")
+        chunk["market_cap"] = pd.to_numeric(chunk["market_cap"], errors="coerce")
+
+        chunk = chunk[
+            (chunk["date"] >= start)
+            & (chunk["date"] <= end)
+        ][["date", "market_cap", "price"]]
+
+        if not chunk.empty:
+            parts.append(chunk)
+
+    if not parts:
+        return pd.DataFrame(columns=["date", "market_cap", "price"])
+
+    out = pd.concat(parts, ignore_index=True)
+    return (
+        out.dropna(subset=["date", "market_cap"])
+        .drop_duplicates("date", keep="last")
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
