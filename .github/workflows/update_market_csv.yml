@@ -27,7 +27,7 @@ jobs:
       - name: Update CSV
         env:
           DART_API_KEY: ${{ secrets.DART_API_KEY }}
-        run: python update_market_csv.py
+        run: python update_market_daily.py
 
       - name: Commit CSV
         run: |
