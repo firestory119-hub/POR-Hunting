@@ -25,7 +25,7 @@ GITHUB_OWNER = "firestory119-hub"
 GITHUB_REPO = "POR-Hunting"
 GITHUB_WORKFLOW = "update_one_daily.yml"
 GITHUB_BULK_WORKFLOW = "update_bulk_daily.yml"
-MAX_BULK_ITEMS = 10
+MAX_BULK_ITEMS = 100
 
 AUTO_REFRESH_SECONDS = 12
 AUTO_REFRESH_MAX_TRIES = 20
@@ -228,35 +228,66 @@ def parse_bulk_input(text, market):
     return resolved, unresolved
 
 
+BULK_REFRESH_MAX_TRIES = 600
+
+
 def start_bulk_polling(items):
-    st.session_state["bulk_collecting_items"] = items
-    st.session_state["bulk_poll_try"] = 0
+    tickers = ",".join(str(item["ticker"]).zfill(6) for item in items)
+    st.query_params["bulk_tickers"] = tickers
+    st.query_params["bulk_poll_try"] = "0"
+
+
+def stop_bulk_polling():
+    for key in ("bulk_tickers", "bulk_poll_try"):
+        try:
+            del st.query_params[key]
+        except Exception:
+            pass
 
 
 def auto_poll_bulk(history, financial):
-    items = st.session_state.get("bulk_collecting_items", [])
-
-    if not items:
-        return False
-
-    remaining = [
-        item
-        for item in items
-        if not is_collected(item["ticker"], history, financial)
+    raw_tickers = query_value("bulk_tickers", "")
+    tickers = [
+        clean_ticker(value)
+        for value in raw_tickers.split(",")
+        if clean_ticker(value)
     ]
 
-    if not remaining:
-        st.session_state.pop("bulk_collecting_items", None)
-        st.session_state.pop("bulk_poll_try", None)
-        st.cache_data.clear()
-        st.success("선택한 종목의 일괄 수집이 모두 완료되었습니다.")
+    if not tickers:
         return False
 
-    attempt = int(st.session_state.get("bulk_poll_try", 0))
+    market_now = load_market()
+    name_map = {}
+    if not market_now.empty:
+        name_map = dict(
+            zip(
+                market_now["종목코드"].astype(str),
+                market_now["종목명"].astype(str),
+            )
+        )
 
-    if attempt >= AUTO_REFRESH_MAX_TRIES:
-        st.session_state.pop("bulk_collecting_items", None)
-        st.session_state.pop("bulk_poll_try", None)
+    remaining = [
+        ticker
+        for ticker in tickers
+        if not is_collected(ticker, history, financial)
+    ]
+    completed = len(tickers) - len(remaining)
+
+    if not remaining:
+        stop_bulk_polling()
+        st.cache_data.clear()
+        st.success(
+            f"선택한 {len(tickers)}개 종목의 일괄 수집이 모두 완료되었습니다."
+        )
+        return False
+
+    try:
+        attempt = int(query_value("bulk_poll_try", "0"))
+    except Exception:
+        attempt = 0
+
+    if attempt >= BULK_REFRESH_MAX_TRIES:
+        stop_bulk_polling()
         st.warning(
             "자동 확인 시간이 끝났습니다. Actions 결과를 확인한 뒤 "
             "데이터 다시 읽기를 눌러주세요."
@@ -264,21 +295,24 @@ def auto_poll_bulk(history, financial):
         return False
 
     attempt += 1
-    st.session_state["bulk_poll_try"] = attempt
+    st.query_params["bulk_poll_try"] = str(attempt)
 
-    names = ", ".join(item["name"] for item in remaining[:5])
+    remaining_names = [
+        name_map.get(ticker, ticker)
+        for ticker in remaining[:5]
+    ]
+    names = ", ".join(remaining_names)
     if len(remaining) > 5:
         names += f" 외 {len(remaining) - 5}개"
 
+    progress = int(completed / max(1, len(tickers)) * 100)
+
     st.info(
-        f"일괄 수집 중: {names} · "
-        f"남은 종목 {len(remaining)}개 · "
-        f"{AUTO_REFRESH_SECONDS}초마다 자동 확인 "
-        f"({attempt}/{AUTO_REFRESH_MAX_TRIES})"
+        f"100개 일괄 수집 진행 중 · 완료 {completed}/{len(tickers)}개 · "
+        f"남은 {len(remaining)}개: {names} · "
+        f"{AUTO_REFRESH_SECONDS}초마다 자동 확인"
     )
-    st.progress(
-        min(100, int(attempt / AUTO_REFRESH_MAX_TRIES * 100))
-    )
+    st.progress(progress)
 
     time.sleep(AUTO_REFRESH_SECONDS)
     st.cache_data.clear()
@@ -673,8 +707,7 @@ with st.expander("🚀 여러 종목 일괄 자동 수집", expanded=True):
 
         if len(new_items) > MAX_BULK_ITEMS:
             st.error(
-                f"신규 종목은 한 번에 최대 {MAX_BULK_ITEMS}개까지 가능합니다. "
-                "나누어 실행해 주세요."
+                f"신규 종목은 한 번에 최대 {MAX_BULK_ITEMS}개까지 가능합니다."
             )
 
         if auto_poll_bulk(history, financial):
