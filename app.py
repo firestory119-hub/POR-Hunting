@@ -1099,6 +1099,7 @@ if run:
 
     c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
     latest = val_df.iloc[-1]
+    st.write(val_df.tail())
 
     latest_fin = fin_df.dropna(subset=["revenue"]).tail(1)
     latest_revenue = latest_fin.iloc[0]["revenue"] if not latest_fin.empty else None
