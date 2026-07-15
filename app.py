@@ -1,4 +1,5 @@
 import os
+import base64
 import csv
 import json
 import urllib.request
@@ -87,12 +88,94 @@ def load_list_csv(path: str, columns: list[str]) -> pd.DataFrame:
     return df[columns].drop_duplicates().copy()
 
 
+
+def save_csv_to_github(df: pd.DataFrame, repo_path: str) -> tuple[bool, str]:
+    """CSV를 GitHub 저장소에 직접 커밋합니다."""
+    try:
+        token = str(st.secrets["GITHUB_TOKEN"]).strip()
+    except Exception:
+        return False, "Streamlit Secrets에 GITHUB_TOKEN이 없습니다."
+
+    if not token:
+        return False, "Streamlit Secrets의 GITHUB_TOKEN이 비어 있습니다."
+
+    api_url = (
+        f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
+        f"/contents/{repo_path}"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "POR-Hunting-Favorites",
+        "Content-Type": "application/json",
+    }
+
+    sha = None
+
+    try:
+        req = urllib.request.Request(api_url, method="GET", headers=headers)
+        with urllib.request.urlopen(req, timeout=20) as response:
+            current = json.loads(response.read().decode("utf-8"))
+            sha = current.get("sha")
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            detail = exc.read().decode("utf-8", errors="ignore")[:300]
+            return False, f"GitHub 파일 확인 실패({exc.code}): {detail}"
+
+    csv_text = df.to_csv(index=False)
+    content = base64.b64encode(
+        csv_text.encode("utf-8-sig")
+    ).decode("ascii")
+
+    payload = {
+        "message": "Update favorites",
+        "content": content,
+        "branch": "main",
+    }
+
+    if sha:
+        payload["sha"] = sha
+
+    req = urllib.request.Request(
+        api_url,
+        data=json.dumps(payload).encode("utf-8"),
+        method="PUT",
+        headers=headers,
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            if response.status in (200, 201):
+                return True, "즐겨찾기를 GitHub에 저장했습니다."
+            return False, f"GitHub 저장 응답 코드: {response.status}"
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")[:500]
+        return False, f"GitHub 저장 실패({exc.code}): {detail}"
+    except Exception as exc:
+        return False, f"GitHub 저장 실패: {exc}"
+
+
 def save_list_csv(df: pd.DataFrame, path: str):
     """
-    저장소 파일에는 쓰지 않고 현재 세션에만 저장합니다.
+    즐겨찾기는 GitHub에 영구 저장하고,
+    최근검색은 현재 세션에만 저장합니다.
     """
+    clean_df = df.drop_duplicates().copy()
     state_key = f"_session_{os.path.basename(path)}"
-    st.session_state[state_key] = df.drop_duplicates().copy()
+    st.session_state[state_key] = clean_df
+
+    if os.path.normpath(path) == os.path.normpath(FAVORITES_FILE):
+        ok, message = save_csv_to_github(
+            clean_df,
+            "data/favorites.csv",
+        )
+        if not ok:
+            st.error(message)
+        return ok, message
+
+    return True, "세션에 저장했습니다."
 
 
 def add_favorite(name: str, ticker: str):
