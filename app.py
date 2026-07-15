@@ -1,5 +1,4 @@
 import os
-import base64
 import csv
 import json
 import urllib.request
@@ -18,7 +17,7 @@ import streamlit as st
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v27 Auto Refresh", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v27 Excel Consensus", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -29,6 +28,7 @@ MARKET_DATA_CSV = os.path.join(DATA_DIR, "market_data.csv")
 FINANCIAL_DATA_CSV = os.path.join(DATA_DIR, "financial_data.csv")
 QUARTERLY_DATA_CSV = os.path.join(DATA_DIR, "financial_quarterly.csv")
 MARKET_HISTORY_CSV = os.path.join(DATA_DIR, "market_history.csv")
+CONSENSUS_XLSX = os.path.join(DATA_DIR, "consensus.xlsx")
 GITHUB_OWNER = "firestory119-hub"
 GITHUB_REPO = "POR-Hunting"
 GITHUB_WORKFLOW = "update_one_daily.yml"
@@ -39,8 +39,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 
 
-st.title("POR Hunting Pro v27 Auto Refresh")
-st.caption("연도·분기·일별 밴드 + 종목별 자동 일별 수집")
+st.title("POR Hunting Pro v27 Excel Consensus")
+st.caption("연도·분기·일별 밴드 + 자동 수집 + Excel 컨센서스")
 
 
 # =========================
@@ -88,94 +88,12 @@ def load_list_csv(path: str, columns: list[str]) -> pd.DataFrame:
     return df[columns].drop_duplicates().copy()
 
 
-
-def save_csv_to_github(df: pd.DataFrame, repo_path: str) -> tuple[bool, str]:
-    """CSV를 GitHub 저장소에 직접 커밋합니다."""
-    try:
-        token = str(st.secrets["GITHUB_TOKEN"]).strip()
-    except Exception:
-        return False, "Streamlit Secrets에 GITHUB_TOKEN이 없습니다."
-
-    if not token:
-        return False, "Streamlit Secrets의 GITHUB_TOKEN이 비어 있습니다."
-
-    api_url = (
-        f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
-        f"/contents/{repo_path}"
-    )
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "POR-Hunting-Favorites",
-        "Content-Type": "application/json",
-    }
-
-    sha = None
-
-    try:
-        req = urllib.request.Request(api_url, method="GET", headers=headers)
-        with urllib.request.urlopen(req, timeout=20) as response:
-            current = json.loads(response.read().decode("utf-8"))
-            sha = current.get("sha")
-    except urllib.error.HTTPError as exc:
-        if exc.code != 404:
-            detail = exc.read().decode("utf-8", errors="ignore")[:300]
-            return False, f"GitHub 파일 확인 실패({exc.code}): {detail}"
-
-    csv_text = df.to_csv(index=False)
-    content = base64.b64encode(
-        csv_text.encode("utf-8-sig")
-    ).decode("ascii")
-
-    payload = {
-        "message": "Update favorites",
-        "content": content,
-        "branch": "main",
-    }
-
-    if sha:
-        payload["sha"] = sha
-
-    req = urllib.request.Request(
-        api_url,
-        data=json.dumps(payload).encode("utf-8"),
-        method="PUT",
-        headers=headers,
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=30) as response:
-            if response.status in (200, 201):
-                return True, "즐겨찾기를 GitHub에 저장했습니다."
-            return False, f"GitHub 저장 응답 코드: {response.status}"
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")[:500]
-        return False, f"GitHub 저장 실패({exc.code}): {detail}"
-    except Exception as exc:
-        return False, f"GitHub 저장 실패: {exc}"
-
-
 def save_list_csv(df: pd.DataFrame, path: str):
     """
-    즐겨찾기는 GitHub에 영구 저장하고,
-    최근검색은 현재 세션에만 저장합니다.
+    저장소 파일에는 쓰지 않고 현재 세션에만 저장합니다.
     """
-    clean_df = df.drop_duplicates().copy()
     state_key = f"_session_{os.path.basename(path)}"
-    st.session_state[state_key] = clean_df
-
-    if os.path.normpath(path) == os.path.normpath(FAVORITES_FILE):
-        ok, message = save_csv_to_github(
-            clean_df,
-            "data/favorites.csv",
-        )
-        if not ok:
-            st.error(message)
-        return ok, message
-
-    return True, "세션에 저장했습니다."
+    st.session_state[state_key] = df.drop_duplicates().copy()
 
 
 def add_favorite(name: str, ticker: str):
@@ -504,6 +422,100 @@ def get_current_price(ticker: str):
     value = clean_num(row.iloc[0].get("현재가"))
     return value if value and value > 0 else None
 
+
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def load_consensus_excel() -> pd.DataFrame:
+    columns = [
+        "name", "ticker", "year", "operating_income_eok",
+        "target_por", "source", "updated_at", "note",
+    ]
+
+    if not os.path.exists(CONSENSUS_XLSX):
+        return pd.DataFrame(columns=columns)
+
+    try:
+        wide = pd.read_excel(
+            CONSENSUS_XLSX,
+            sheet_name="컨센서스입력",
+            header=1,
+            dtype={"종목코드": str},
+        )
+    except Exception:
+        return pd.DataFrame(columns=columns)
+
+    required = {"종목명", "종목코드"}
+    if not required.issubset(wide.columns):
+        return pd.DataFrame(columns=columns)
+
+    year_cols = [
+        col for col in wide.columns
+        if re.fullmatch(r"\d{4}E?", str(col).strip())
+    ]
+    if not year_cols:
+        return pd.DataFrame(columns=columns)
+
+    id_cols = [
+        col for col in [
+            "종목명", "종목코드", "목표POR",
+            "출처", "업데이트일", "비고",
+        ]
+        if col in wide.columns
+    ]
+
+    long_df = wide.melt(
+        id_vars=id_cols,
+        value_vars=year_cols,
+        var_name="year",
+        value_name="operating_income_eok",
+    )
+
+    long_df = long_df.rename(columns={
+        "종목명": "name",
+        "종목코드": "ticker",
+        "목표POR": "target_por",
+        "출처": "source",
+        "업데이트일": "updated_at",
+        "비고": "note",
+    })
+
+    long_df["ticker"] = (
+        long_df["ticker"].astype(str)
+        .str.replace(r"\.0$", "", regex=True)
+        .str.zfill(6)
+    )
+    long_df["year"] = pd.to_numeric(
+        long_df["year"].astype(str).str.extract(r"(\d{4})")[0],
+        errors="coerce",
+    )
+    long_df["operating_income_eok"] = pd.to_numeric(
+        long_df["operating_income_eok"], errors="coerce"
+    )
+    long_df["target_por"] = pd.to_numeric(
+        long_df.get("target_por"), errors="coerce"
+    )
+
+    return (
+        long_df.dropna(
+            subset=["ticker", "year", "operating_income_eok"]
+        )
+        .sort_values(["ticker", "year"])
+        .reset_index(drop=True)
+    )
+
+
+def get_consensus_for_ticker(ticker: str) -> pd.DataFrame:
+    df = load_consensus_excel()
+    if df.empty:
+        return df
+
+    return (
+        df[df["ticker"] == str(ticker).zfill(6)]
+        .copy()
+        .sort_values("year")
+        .reset_index(drop=True)
+    )
 
 
 def request_daily_collection(ticker: str, name: str) -> tuple[bool, str]:
@@ -1095,12 +1107,34 @@ if run:
             st.error("시가총액 데이터를 가져오지 못했습니다.")
         st.stop()
 
+    consensus_df = get_consensus_for_ticker(ticker)
+
+    applied_forward_year = int(forward_year)
+    applied_forward_oi_eok = (
+        float(forward_oi_eok)
+        if forward_oi_eok and forward_oi_eok > 0
+        else None
+    )
+
+    if applied_forward_oi_eok is None and not consensus_df.empty:
+        future_consensus = consensus_df[
+            consensus_df["year"] >= datetime.today().year
+        ]
+        if future_consensus.empty:
+            future_consensus = consensus_df.copy()
+
+        first_consensus = future_consensus.iloc[0]
+        applied_forward_year = int(first_consensus["year"])
+        applied_forward_oi_eok = float(
+            first_consensus["operating_income_eok"]
+        )
+
     val_df = make_valuation_df(
         mcap_df,
         fin_df,
         valuation_metric,
-        int(forward_year),
-        forward_oi_eok if forward_oi_eok > 0 else None,
+        applied_forward_year,
+        applied_forward_oi_eok,
     )
 
     if val_df.empty:
@@ -1148,7 +1182,7 @@ if run:
     projected_multiple = None
     projected_mcap_eok = None
 
-    if forward_oi_eok and forward_oi_eok > 0:
+    if applied_forward_oi_eok and applied_forward_oi_eok > 0:
         latest_for_projection = val_df.iloc[-1]
         current_mcap_eok_for_projection = latest_for_projection["market_cap"] / 100_000_000
 
@@ -1167,12 +1201,12 @@ if run:
             else:
                 projected_price_for_display = None
 
-        projected_multiple = projected_mcap_eok / forward_oi_eok
+        projected_multiple = projected_mcap_eok / applied_forward_oi_eok
 
         projected_info = {
-            "year": int(forward_year),
-            "date": pd.Timestamp(year=int(forward_year), month=12, day=31),
-            "oi_eok": float(forward_oi_eok),
+            "year": int(applied_forward_year),
+            "date": pd.Timestamp(year=int(applied_forward_year), month=12, day=31),
+            "oi_eok": float(applied_forward_oi_eok),
             "mcap_eok": float(projected_mcap_eok),
             "price": float(projected_price_for_display) if projected_price_for_display else None,
             "multiple": float(projected_multiple),
@@ -1244,13 +1278,107 @@ if run:
 
         with st.expander("예상 시나리오 상세", expanded=False):
             d1, d2, d3 = st.columns(3)
-            d1.metric(f"{int(forward_year)}E {expected_base_label}", f"{forward_oi_eok:,.1f}억")
+            d1.metric(f"{int(forward_year)}E {expected_base_label}", f"{applied_forward_oi_eok:,.1f}억")
             d2.metric("예상 시가총액", f"{projected_mcap_eok:,.0f}억")
             d3.metric(f"현재 {valuation_metric} 대비", f"{(projected_multiple / latest['ratio'] - 1) * 100:.1f}%")
 
+    if not consensus_df.empty:
+        st.markdown("### 저장된 연도별 영업이익 컨센서스")
+
+        consensus_show = consensus_df.copy()
+        current_mcap_eok_consensus = latest["market_cap"] / 100_000_000
+
+        consensus_show["현재 시총 기준 POR"] = (
+            current_mcap_eok_consensus
+            / consensus_show["operating_income_eok"]
+        )
+
+        consensus_show["적용 목표 POR"] = (
+            consensus_show["target_por"]
+            .where(
+                consensus_show["target_por"] > 0,
+                float(target_por_slider),
+            )
+        )
+
+        consensus_show["목표 시가총액(억)"] = (
+            consensus_show["operating_income_eok"]
+            * consensus_show["적용 목표 POR"]
+        )
+
+        if current_price and current_mcap_eok_consensus > 0:
+            consensus_show["목표 주가(원)"] = (
+                current_price
+                * consensus_show["목표 시가총액(억)"]
+                / current_mcap_eok_consensus
+            )
+            consensus_show["상승여력(%)"] = (
+                consensus_show["목표 주가(원)"]
+                / current_price - 1
+            ) * 100
+        else:
+            consensus_show["목표 주가(원)"] = None
+            consensus_show["상승여력(%)"] = None
+
+        consensus_show["연도"] = (
+            consensus_show["year"].astype(int).astype(str) + "E"
+        )
+        consensus_show["예상 영업이익(억)"] = (
+            consensus_show["operating_income_eok"].round(1)
+        )
+        consensus_show["현재 시총 기준 POR"] = (
+            consensus_show["현재 시총 기준 POR"].round(2)
+        )
+        consensus_show["적용 목표 POR"] = (
+            consensus_show["적용 목표 POR"].round(2)
+        )
+        consensus_show["목표 시가총액(억)"] = (
+            consensus_show["목표 시가총액(억)"].round(1)
+        )
+        consensus_show["목표 주가(원)"] = (
+            pd.to_numeric(
+                consensus_show["목표 주가(원)"],
+                errors="coerce",
+            ).round(0)
+        )
+        consensus_show["상승여력(%)"] = (
+            pd.to_numeric(
+                consensus_show["상승여력(%)"],
+                errors="coerce",
+            ).round(1)
+        )
+
+        st.dataframe(
+            consensus_show[
+                [
+                    "연도",
+                    "예상 영업이익(억)",
+                    "현재 시총 기준 POR",
+                    "적용 목표 POR",
+                    "목표 시가총액(억)",
+                    "목표 주가(원)",
+                    "상승여력(%)",
+                    "source",
+                    "updated_at",
+                    "note",
+                ]
+            ].rename(columns={
+                "source": "출처",
+                "updated_at": "업데이트일",
+                "note": "비고",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.caption(
+            "사이드바 예상 영업이익을 직접 입력하면 수동값 우선. "
+            "0이면 엑셀의 가장 가까운 미래 연도가 자동 적용됩니다."
+        )
+
     # v20: 목표 POR 슬라이더 계산
-    if forward_oi_eok and forward_oi_eok > 0:
-        target_mcap_eok_by_slider = target_por_slider * forward_oi_eok
+    if applied_forward_oi_eok and applied_forward_oi_eok > 0:
+        target_mcap_eok_by_slider = target_por_slider * applied_forward_oi_eok
         target_price_by_slider = None
         target_upside_by_slider = None
         if current_price and latest["market_cap"] > 0:
@@ -1267,7 +1395,7 @@ if run:
         with st.expander("목표 POR 상세 계산", expanded=False):
             td1, td2 = st.columns(2)
             td1.metric("목표 시가총액", f"{target_mcap_eok_by_slider:,.0f}억")
-            td2.metric("적용 영업이익", f"{forward_oi_eok:,.1f}억")
+            td2.metric("적용 영업이익", f"{applied_forward_oi_eok:,.1f}억")
 
 
     # v22: POR Calculator Pro
@@ -1276,9 +1404,9 @@ if run:
 
         calc_base_eok = None
         calc_base_label = "현재 적용 기준값"
-        if forward_oi_eok and forward_oi_eok > 0:
-            calc_base_eok = float(forward_oi_eok)
-            calc_base_label = f"{int(forward_year)}E {expected_base_label}"
+        if applied_forward_oi_eok and applied_forward_oi_eok > 0:
+            calc_base_eok = float(applied_forward_oi_eok)
+            calc_base_label = f"{int(applied_forward_year)}E {expected_base_label}"
         elif latest["base_value"] and pd.notna(latest["base_value"]) and latest["base_value"] > 0:
             calc_base_eok = latest["base_value"] / 100_000_000
 
@@ -1379,9 +1507,9 @@ if run:
         st.markdown("### 적정가 시나리오")
 
         scenario_base_eok = None
-        if forward_oi_eok and forward_oi_eok > 0:
-            scenario_base_eok = float(forward_oi_eok)
-            scenario_label = f"{int(forward_year)}E {expected_base_label}"
+        if applied_forward_oi_eok and applied_forward_oi_eok > 0:
+            scenario_base_eok = float(applied_forward_oi_eok)
+            scenario_label = f"{int(applied_forward_year)}E {expected_base_label}"
         elif latest["base_value"] and pd.notna(latest["base_value"]) and latest["base_value"] > 0:
             scenario_base_eok = latest["base_value"] / 100_000_000
             scenario_label = "현재 적용 기준값"
