@@ -17,7 +17,7 @@ import streamlit as st
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v38 Transparent POR", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v39 Favorite Navigator", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -39,8 +39,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 
 
-st.title("POR Hunting Pro v38 Transparent POR")
-st.caption("최근 흑자·적자·컨센서스 계산 근거를 분리한 POR 분석")
+st.title("POR Hunting Pro v39 Favorite Navigator")
+st.caption("즐겨찾기 원키 넘기기 + 투명한 POR 계산 근거")
 
 
 # =========================
@@ -936,6 +936,107 @@ with st.sidebar:
         key="quick_stock_select",
     )
 
+    # V39: 즐겨찾기 원키 넘기기
+    favorite_rows = []
+
+    if not fav_df_side.empty:
+        favorite_rows = (
+            fav_df_side
+            .sort_values("saved_at", ascending=False)
+            .drop_duplicates(subset=["ticker"], keep="first")
+            [["name", "ticker"]]
+            .to_dict("records")
+        )
+
+    if favorite_rows:
+        favorite_count = len(favorite_rows)
+
+        current_favorite_index = int(
+            st.session_state.get("favorite_nav_index", 0)
+        )
+        current_favorite_index = max(
+            0,
+            min(current_favorite_index, favorite_count - 1),
+        )
+        st.session_state["favorite_nav_index"] = (
+            current_favorite_index
+        )
+
+        nav_prev, nav_count, nav_next = st.columns(
+            [1, 1.2, 1]
+        )
+
+        with nav_prev:
+            if st.button(
+                "◀ 이전",
+                use_container_width=True,
+                key="favorite_prev_button",
+            ):
+                next_index = (
+                    current_favorite_index - 1
+                ) % favorite_count
+                selected_favorite = favorite_rows[next_index]
+
+                st.session_state["favorite_nav_index"] = (
+                    next_index
+                )
+                st.session_state["_favorite_nav_name"] = (
+                    selected_favorite["name"]
+                )
+                st.session_state["_favorite_nav_ticker"] = (
+                    selected_favorite["ticker"]
+                )
+                st.rerun()
+
+        with nav_count:
+            st.markdown(
+                (
+                    "<div style='text-align:center;"
+                    "padding-top:0.45rem;font-weight:700;'>"
+                    f"{current_favorite_index + 1} / "
+                    f"{favorite_count}"
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+
+        with nav_next:
+            if st.button(
+                "다음 ▶",
+                use_container_width=True,
+                type="primary",
+                key="favorite_next_button",
+            ):
+                next_index = (
+                    current_favorite_index + 1
+                ) % favorite_count
+                selected_favorite = favorite_rows[next_index]
+
+                st.session_state["favorite_nav_index"] = (
+                    next_index
+                )
+                st.session_state["_favorite_nav_name"] = (
+                    selected_favorite["name"]
+                )
+                st.session_state["_favorite_nav_ticker"] = (
+                    selected_favorite["ticker"]
+                )
+                st.rerun()
+
+        current_favorite = favorite_rows[
+            st.session_state["favorite_nav_index"]
+        ]
+        st.caption(
+            "현재 순서: "
+            f"{current_favorite['name']} "
+            f"({current_favorite['ticker']})"
+        )
+    else:
+        st.caption(
+            "즐겨찾기를 추가하면 ◀ 이전 / 다음 ▶ 버튼으로 "
+            "차트를 바로 넘길 수 있습니다."
+        )
+
     st.divider()
 
     valuation_metric = st.radio(
@@ -993,17 +1094,55 @@ with st.sidebar:
 # =========================
 # 메인 화면
 # =========================
-default_query = _query_value("collecting_name", "삼성전자")
-try:
-    if selected_quick != "직접 입력":
-        default_query = quick_map.get(selected_quick, "삼성전자")
-except Exception:
-    pass
+default_query = _query_value(
+    "collecting_name",
+    "삼성전자",
+)
+
+# 즐겨찾기 이전/다음 버튼에서 넘어온 종목을 최우선 적용
+favorite_nav_name = st.session_state.pop(
+    "_favorite_nav_name",
+    None,
+)
+
+if favorite_nav_name:
+    st.session_state["stock_query"] = (
+        favorite_nav_name
+    )
+else:
+    try:
+        if selected_quick != "직접 입력":
+            selected_quick_name = quick_map.get(
+                selected_quick,
+                "삼성전자",
+            )
+
+            if (
+                st.session_state.get(
+                    "_last_quick_selection"
+                )
+                != selected_quick
+            ):
+                st.session_state["stock_query"] = (
+                    selected_quick_name
+                )
+                st.session_state[
+                    "_last_quick_selection"
+                ] = selected_quick
+    except Exception:
+        pass
+
+if "stock_query" not in st.session_state:
+    st.session_state["stock_query"] = default_query
 
 query = st.text_input(
     "Stock Name",
-    value=default_query,
-    help="종목명을 입력하고 엔터를 누르면 자동으로 조회됩니다."
+    key="stock_query",
+    help=(
+        "종목명을 입력하고 엔터를 누르면 자동으로 조회됩니다. "
+        "즐겨찾기는 사이드바의 ◀ 이전 / 다음 ▶ 버튼으로 "
+        "즉시 넘길 수 있습니다."
+    ),
 )
 
 run = bool(query.strip())
