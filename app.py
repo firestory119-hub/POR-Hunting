@@ -17,7 +17,7 @@ import streamlit as st
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v39 Favorite Navigator", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v40 Favorite Reset", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -39,8 +39,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 
 
-st.title("POR Hunting Pro v39 Favorite Navigator")
-st.caption("즐겨찾기 원키 넘기기 + 투명한 POR 계산 근거")
+st.title("POR Hunting Pro v40 Favorite Reset")
+st.caption("즐겨찾기 원키 넘기기 + 종목 변경 시 예상값 자동 초기화")
 
 
 # =========================
@@ -1070,6 +1070,7 @@ with st.sidebar:
         min_value=2020,
         max_value=2035,
         step=1,
+        key="forward_year_input",
     )
 
     if valuation_metric == "POR":
@@ -1079,9 +1080,24 @@ with st.sidebar:
     else:
         expected_base_label = "예상 자본총계"
 
-    forward_oi_eok = st.number_input(f"{expected_base_label}(억원, 선택)", value=0.0, step=10.0)
-    expected_mcap_eok = st.number_input("예상 시가총액(억원, 선택)", value=0.0, step=50.0)
-    expected_price = st.number_input("예상 주가(원, 선택)", value=0.0, step=100.0)
+    forward_oi_eok = st.number_input(
+        f"{expected_base_label}(억원, 선택)",
+        value=0.0,
+        step=10.0,
+        key="forward_oi_input",
+    )
+    expected_mcap_eok = st.number_input(
+        "예상 시가총액(억원, 선택)",
+        value=0.0,
+        step=50.0,
+        key="expected_mcap_input",
+    )
+    expected_price = st.number_input(
+        "예상 주가(원, 선택)",
+        value=0.0,
+        step=100.0,
+        key="expected_price_input",
+    )
     target_por_slider = st.slider(f"목표 {valuation_metric}", 1.0, 30.0, 8.0, 0.5)
     bear_por = st.number_input("보수 POR", value=5.0, step=0.5)
     base_por = st.number_input("적정 POR", value=8.0, step=0.5)
@@ -1182,6 +1198,17 @@ if run:
     row = found[found["stock_code"] == ticker].iloc[0]
     corp_code = ""
     name = row["corp_name"]
+
+    # V40: 다른 종목으로 넘어가면 수동 예상값 자동 초기화
+    previous_ticker = st.session_state.get("_active_stock_ticker")
+
+    if previous_ticker is not None and previous_ticker != ticker:
+        st.session_state["forward_year_input"] = datetime.today().year
+        st.session_state["forward_oi_input"] = 0.0
+        st.session_state["expected_mcap_input"] = 0.0
+        st.session_state["expected_price_input"] = 0.0
+
+    st.session_state["_active_stock_ticker"] = ticker
 
     add_history(name, ticker)
 
