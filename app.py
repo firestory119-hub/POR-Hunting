@@ -17,7 +17,7 @@ import streamlit as st
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v40.1 Safe Reset", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v40.2 Callback Reset", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -39,8 +39,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 
 
-st.title("POR Hunting Pro v40.1 Safe Reset")
-st.caption("즐겨찾기 원키 넘기기 + 안전한 예상값 자동 초기화")
+st.title("POR Hunting Pro v40.2 Callback Reset")
+st.caption("즐겨찾기 원키 넘기기 + 콜백 기반 예상값 완전 초기화")
 
 
 # =========================
@@ -905,6 +905,67 @@ def reset_manual_projection_inputs():
         st.session_state.pop(key, None)
 
 
+def navigate_favorite(direction: int, favorite_rows: list[dict]):
+    """
+    Streamlit 버튼 콜백.
+    콜백은 새 화면을 그리기 전에 실행되므로 예상 입력값이 확실히 초기화됩니다.
+    """
+    if not favorite_rows:
+        return
+
+    count = len(favorite_rows)
+    current_index = int(
+        st.session_state.get("favorite_nav_index", 0)
+    )
+    next_index = (current_index + int(direction)) % count
+    selected = favorite_rows[next_index]
+
+    reset_manual_projection_inputs()
+
+    st.session_state["favorite_nav_index"] = next_index
+    st.session_state["stock_query"] = selected["name"]
+    st.session_state["_favorite_nav_ticker"] = selected["ticker"]
+
+    # 빠른 선택 드롭다운과 충돌하지 않도록 직접 입력으로 되돌립니다.
+    st.session_state["quick_stock_select"] = "직접 입력"
+    st.session_state["_last_quick_selection"] = "직접 입력"
+
+
+def apply_quick_selection(quick_map: dict):
+    """빠른 선택 변경 콜백."""
+    selected = st.session_state.get(
+        "quick_stock_select",
+        "직접 입력",
+    )
+
+    if selected == "직접 입력":
+        return
+
+    selected_name = quick_map.get(selected)
+    if not selected_name:
+        return
+
+    reset_manual_projection_inputs()
+    st.session_state["stock_query"] = selected_name
+    st.session_state["_last_quick_selection"] = selected
+
+
+def on_stock_query_change():
+    """검색창에서 다른 종목을 입력할 때 수동 예상값을 초기화합니다."""
+    current_query = str(
+        st.session_state.get("stock_query", "")
+    ).strip()
+
+    previous_query = str(
+        st.session_state.get("_last_stock_query", "")
+    ).strip()
+
+    if previous_query and current_query != previous_query:
+        reset_manual_projection_inputs()
+
+    st.session_state["_last_stock_query"] = current_query
+
+
 
 # =========================
 # 사이드바
@@ -946,6 +1007,8 @@ with st.sidebar:
         ["직접 입력"] + quick_options,
         index=0,
         key="quick_stock_select",
+        on_change=apply_quick_selection,
+        args=(quick_map,),
     )
 
     # V39: 즐겨찾기 원키 넘기기
@@ -979,27 +1042,13 @@ with st.sidebar:
         )
 
         with nav_prev:
-            if st.button(
+            st.button(
                 "◀ 이전",
                 use_container_width=True,
                 key="favorite_prev_button",
-            ):
-                next_index = (
-                    current_favorite_index - 1
-                ) % favorite_count
-                selected_favorite = favorite_rows[next_index]
-
-                st.session_state["favorite_nav_index"] = (
-                    next_index
-                )
-                st.session_state["_favorite_nav_name"] = (
-                    selected_favorite["name"]
-                )
-                st.session_state["_favorite_nav_ticker"] = (
-                    selected_favorite["ticker"]
-                )
-                reset_manual_projection_inputs()
-                st.rerun()
+                on_click=navigate_favorite,
+                args=(-1, favorite_rows),
+            )
 
         with nav_count:
             st.markdown(
@@ -1014,28 +1063,14 @@ with st.sidebar:
             )
 
         with nav_next:
-            if st.button(
+            st.button(
                 "다음 ▶",
                 use_container_width=True,
                 type="primary",
                 key="favorite_next_button",
-            ):
-                next_index = (
-                    current_favorite_index + 1
-                ) % favorite_count
-                selected_favorite = favorite_rows[next_index]
-
-                st.session_state["favorite_nav_index"] = (
-                    next_index
-                )
-                st.session_state["_favorite_nav_name"] = (
-                    selected_favorite["name"]
-                )
-                st.session_state["_favorite_nav_ticker"] = (
-                    selected_favorite["ticker"]
-                )
-                reset_manual_projection_inputs()
-                st.rerun()
+                on_click=navigate_favorite,
+                args=(1, favorite_rows),
+            )
 
         current_favorite = favorite_rows[
             st.session_state["favorite_nav_index"]
@@ -1129,52 +1164,22 @@ default_query = _query_value(
     "삼성전자",
 )
 
-# 즐겨찾기 이전/다음 버튼에서 넘어온 종목을 최우선 적용
-favorite_nav_name = st.session_state.pop(
-    "_favorite_nav_name",
-    None,
-)
-
-if favorite_nav_name:
-    st.session_state["stock_query"] = (
-        favorite_nav_name
-    )
-else:
-    try:
-        if selected_quick != "직접 입력":
-            selected_quick_name = quick_map.get(
-                selected_quick,
-                "삼성전자",
-            )
-
-            if (
-                st.session_state.get(
-                    "_last_quick_selection"
-                )
-                != selected_quick
-            ):
-                reset_manual_projection_inputs()
-                st.session_state["stock_query"] = (
-                    selected_quick_name
-                )
-                st.session_state[
-                    "_last_quick_selection"
-                ] = selected_quick
-    except Exception:
-        pass
-
 if "stock_query" not in st.session_state:
     st.session_state["stock_query"] = default_query
 
 query = st.text_input(
     "Stock Name",
     key="stock_query",
+    on_change=on_stock_query_change,
     help=(
         "종목명을 입력하고 엔터를 누르면 자동으로 조회됩니다. "
         "즐겨찾기는 사이드바의 ◀ 이전 / 다음 ▶ 버튼으로 "
         "즉시 넘길 수 있습니다."
     ),
 )
+
+if "_last_stock_query" not in st.session_state:
+    st.session_state["_last_stock_query"] = query
 
 run = bool(query.strip())
 
