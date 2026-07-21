@@ -17,7 +17,7 @@ import streamlit as st
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v40 Favorite Reset", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v40.1 Safe Reset", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -39,8 +39,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 
 
-st.title("POR Hunting Pro v40 Favorite Reset")
-st.caption("즐겨찾기 원키 넘기기 + 종목 변경 시 예상값 자동 초기화")
+st.title("POR Hunting Pro v40.1 Safe Reset")
+st.caption("즐겨찾기 원키 넘기기 + 안전한 예상값 자동 초기화")
 
 
 # =========================
@@ -894,6 +894,18 @@ def plot_valuation(val_df: pd.DataFrame, title: str, metric: str, chart_range: s
     return fig, mean, std, len(plot_df), base_date, plot_df
 
 
+def reset_manual_projection_inputs():
+    """종목 변경 전에 수동 예상 입력 위젯 상태를 안전하게 삭제합니다."""
+    for key in (
+        "forward_year_input",
+        "forward_oi_input",
+        "expected_mcap_input",
+        "expected_price_input",
+    ):
+        st.session_state.pop(key, None)
+
+
+
 # =========================
 # 사이드바
 # =========================
@@ -986,6 +998,7 @@ with st.sidebar:
                 st.session_state["_favorite_nav_ticker"] = (
                     selected_favorite["ticker"]
                 )
+                reset_manual_projection_inputs()
                 st.rerun()
 
         with nav_count:
@@ -1021,6 +1034,7 @@ with st.sidebar:
                 st.session_state["_favorite_nav_ticker"] = (
                     selected_favorite["ticker"]
                 )
+                reset_manual_projection_inputs()
                 st.rerun()
 
         current_favorite = favorite_rows[
@@ -1139,6 +1153,7 @@ else:
                 )
                 != selected_quick
             ):
+                reset_manual_projection_inputs()
                 st.session_state["stock_query"] = (
                     selected_quick_name
                 )
@@ -1198,17 +1213,6 @@ if run:
     row = found[found["stock_code"] == ticker].iloc[0]
     corp_code = ""
     name = row["corp_name"]
-
-    # V40: 다른 종목으로 넘어가면 수동 예상값 자동 초기화
-    previous_ticker = st.session_state.get("_active_stock_ticker")
-
-    if previous_ticker is not None and previous_ticker != ticker:
-        st.session_state["forward_year_input"] = datetime.today().year
-        st.session_state["forward_oi_input"] = 0.0
-        st.session_state["expected_mcap_input"] = 0.0
-        st.session_state["expected_price_input"] = 0.0
-
-    st.session_state["_active_stock_ticker"] = ticker
 
     add_history(name, ticker)
 
