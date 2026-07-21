@@ -17,7 +17,7 @@ import streamlit as st
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v40.2 Callback Reset", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v41 Per-Stock Inputs", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -39,8 +39,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 
 
-st.title("POR Hunting Pro v40.2 Callback Reset")
-st.caption("즐겨찾기 원키 넘기기 + 콜백 기반 예상값 완전 초기화")
+st.title("POR Hunting Pro v41 Per-Stock Inputs")
+st.caption("즐겨찾기 원키 넘기기 + 종목별 독립 예상 입력")
 
 
 # =========================
@@ -895,14 +895,23 @@ def plot_valuation(val_df: pd.DataFrame, title: str, metric: str, chart_range: s
 
 
 def reset_manual_projection_inputs():
-    """종목 변경 전에 수동 예상 입력 위젯 상태를 안전하게 삭제합니다."""
-    for key in (
+    """
+    현재 세션의 수동 예상 입력 위젯 상태를 정리합니다.
+    V41부터 종목별 동적 키를 사용하므로 다른 종목 값이 섞이지 않습니다.
+    """
+    prefixes = (
         "forward_year_input",
         "forward_oi_input",
         "expected_mcap_input",
         "expected_price_input",
-    ):
-        st.session_state.pop(key, None)
+    )
+
+    for key in list(st.session_state.keys()):
+        if any(
+            key == prefix or key.startswith(f"{prefix}_")
+            for prefix in prefixes
+        ):
+            st.session_state.pop(key, None)
 
 
 def navigate_favorite(direction: int, favorite_rows: list[dict]):
@@ -965,6 +974,70 @@ def on_stock_query_change():
 
     st.session_state["_last_stock_query"] = current_query
 
+
+
+def resolve_sidebar_stock_key() -> str:
+    """
+    사이드바 위젯 키에 사용할 현재 종목코드를 미리 찾습니다.
+    즐겨찾기/빠른선택/검색창 변경 후 새 종목코드가 곧바로 반영되므로,
+    종목마다 서로 다른 예상 입력 위젯 상태를 사용합니다.
+    """
+    query_value = str(
+        st.session_state.get(
+            "stock_query",
+            _query_value("collecting_name", "삼성전자"),
+        )
+    ).strip()
+
+    if not query_value:
+        return "default"
+
+    try:
+        market = _load_market_csv()
+    except Exception:
+        return re.sub(r"[^0-9A-Za-z가-힣]", "_", query_value)[:30] or "default"
+
+    code_query = (
+        query_value.replace(".0", "")
+        if query_value
+        else ""
+    )
+
+    if code_query.isdigit():
+        code_query = code_query.zfill(6)
+        exact_code = market[
+            market["종목코드"].astype(str) == code_query
+        ]
+        if not exact_code.empty:
+            return str(exact_code.iloc[0]["종목코드"])
+
+    exact_name = market[
+        market["종목명"].astype(str).str.lower()
+        == query_value.lower()
+    ]
+    if not exact_name.empty:
+        return str(exact_name.iloc[0]["종목코드"])
+
+    contains_name = market[
+        market["종목명"]
+        .astype(str)
+        .str.lower()
+        .str.contains(
+            re.escape(query_value.lower()),
+            na=False,
+        )
+    ]
+    if not contains_name.empty:
+        return str(contains_name.iloc[0]["종목코드"])
+
+    return re.sub(
+        r"[^0-9A-Za-z가-힣]",
+        "_",
+        query_value,
+    )[:30] or "default"
+
+
+sidebar_stock_key = resolve_sidebar_stock_key()
 
 
 # =========================
@@ -1119,7 +1192,7 @@ with st.sidebar:
         min_value=2020,
         max_value=2035,
         step=1,
-        key="forward_year_input",
+        key=f"forward_year_input_{sidebar_stock_key}",
     )
 
     if valuation_metric == "POR":
@@ -1133,19 +1206,19 @@ with st.sidebar:
         f"{expected_base_label}(억원, 선택)",
         value=0.0,
         step=10.0,
-        key="forward_oi_input",
+        key=f"forward_oi_input_{sidebar_stock_key}",
     )
     expected_mcap_eok = st.number_input(
         "예상 시가총액(억원, 선택)",
         value=0.0,
         step=50.0,
-        key="expected_mcap_input",
+        key=f"expected_mcap_input_{sidebar_stock_key}",
     )
     expected_price = st.number_input(
         "예상 주가(원, 선택)",
         value=0.0,
         step=100.0,
-        key="expected_price_input",
+        key=f"expected_price_input_{sidebar_stock_key}",
     )
     target_por_slider = st.slider(f"목표 {valuation_metric}", 1.0, 30.0, 8.0, 0.5)
     bear_por = st.number_input("보수 POR", value=5.0, step=0.5)
@@ -1218,6 +1291,25 @@ if run:
     row = found[found["stock_code"] == ticker].iloc[0]
     corp_code = ""
     name = row["corp_name"]
+
+    # 검색 결과에서 선택한 종목과 사이드바 위젯 종목키가 다르면
+    # 검색어를 정확한 종목명으로 맞춘 뒤 한 번만 재실행합니다.
+    if str(sidebar_stock_key) != str(ticker):
+        sync_guard = st.session_state.get(
+            "_sidebar_stock_sync_guard"
+        )
+
+        if sync_guard != str(ticker):
+            st.session_state[
+                "_sidebar_stock_sync_guard"
+            ] = str(ticker)
+            st.session_state["stock_query"] = name
+            st.rerun()
+    else:
+        st.session_state.pop(
+            "_sidebar_stock_sync_guard",
+            None,
+        )
 
     add_history(name, ticker)
 
