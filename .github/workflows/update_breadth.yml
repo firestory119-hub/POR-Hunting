@@ -3,7 +3,7 @@ name: Update Market Breadth
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 8 * * 1-5'
+    - cron: '35 8 * * 1-5'  # 한국시간 평일 17:35
 
 permissions:
   contents: write
@@ -11,20 +11,31 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install packages
-        run: pip install pandas requests pykrx finance-datareader
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install pandas requests pykrx
+
       - name: Build breadth data
+        env:
+          BREADTH_WORKERS: '28'
         run: python update_breadth.py
+
       - name: Commit breadth data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/breadth_history.csv data/breadth_close_history.csv
-          git diff --cached --quiet || git commit -m "Update market breadth"
-          git push
+          git add data/breadth_close_history.csv data/breadth_history.csv
+          if git diff --cached --quiet; then
+            echo "No breadth changes"
+          else
+            git commit -m "Update market breadth"
+            git push
+          fi
