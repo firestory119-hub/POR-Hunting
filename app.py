@@ -1127,7 +1127,84 @@ def render_breadth_page():
     cols[5].metric("시장 신호", signal)
     st.caption(f"기준일 {latest_date:%Y-%m-%d} · {signal_desc}")
 
+    # Bloomberg 스타일 통합 차트: 지수 + 지수 200일선 + 200일선 위 종목 비율
+    combined = plot_df.copy()
+    if "index_close" in combined.columns:
+        combined["index_ma200"] = combined["index_close"].rolling(200, min_periods=20).mean()
+
     fig = go.Figure()
+
+    if "above_ma200" in combined.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=combined["date"],
+                y=combined["above_ma200"],
+                mode="lines",
+                name="200일선 위 종목 비율",
+                fill="tozeroy",
+                opacity=0.48,
+                line=dict(width=1.5),
+                yaxis="y",
+                hovertemplate="%{x|%Y-%m-%d}<br>200일선 위: %{y:.1f}%<extra></extra>",
+            )
+        )
+
+    if "index_close" in combined.columns and combined["index_close"].notna().any():
+        fig.add_trace(
+            go.Scatter(
+                x=combined["date"],
+                y=combined["index_close"],
+                mode="lines",
+                name=f"{market} 지수",
+                line=dict(width=2.2),
+                yaxis="y2",
+                hovertemplate=f"%{{x|%Y-%m-%d}}<br>{market}: %{{y:,.2f}}<extra></extra>",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=combined["date"],
+                y=combined["index_ma200"],
+                mode="lines",
+                name="지수 200일선",
+                line=dict(width=2),
+                yaxis="y2",
+                hovertemplate="%{x|%Y-%m-%d}<br>지수 200일선: %{y:,.2f}<extra></extra>",
+            )
+        )
+
+    if "vkospi" in combined.columns and combined["vkospi"].notna().any():
+        fig.add_trace(
+            go.Scatter(
+                x=combined["date"],
+                y=combined["vkospi"],
+                mode="lines",
+                name="VKOSPI",
+                line=dict(width=1.5, dash="dot"),
+                yaxis="y3",
+                hovertemplate="%{x|%Y-%m-%d}<br>VKOSPI: %{y:.2f}<extra></extra>",
+            )
+        )
+
+    fig.add_hline(y=80, line_dash="dot", annotation_text="과열 80%", yref="y")
+    fig.add_hline(y=20, line_dash="dot", annotation_text="침체 20%", yref="y")
+    fig.update_layout(
+        title=f"{market} 지수 · 200일선 · Market Breadth",
+        height=650,
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.08, x=0),
+        margin=dict(l=45, r=65, t=90, b=45),
+        yaxis=dict(title="200일선 위 종목 비율(%)", range=[0, 100], side="left"),
+        yaxis2=dict(title=f"{market} 지수", overlaying="y", side="right", showgrid=False),
+        yaxis3=dict(title="VKOSPI", overlaying="y", side="right", position=0.93, showgrid=False),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    if "vkospi" not in combined.columns or not combined.get("vkospi", pd.Series(dtype=float)).notna().any():
+        st.caption("※ 현재 데이터에는 VKOSPI가 없어 지수·200일선·Breadth만 표시됩니다. VKOSPI 수집이 추가되면 같은 차트에 자동 표시됩니다.")
+
+    # 단기·중기 Breadth 비교 차트
+    breadth_fig = go.Figure()
     for col, label in [
         ("above_ma20", "20일선 위 비율"),
         ("above_ma60", "60일선 위 비율"),
@@ -1135,12 +1212,18 @@ def render_breadth_page():
         ("above_ma200", "200일선 위 비율"),
     ]:
         if col in plot_df.columns:
-            fig.add_trace(go.Scatter(x=plot_df["date"], y=plot_df[col], mode="lines", name=label))
+            breadth_fig.add_trace(go.Scatter(x=plot_df["date"], y=plot_df[col], mode="lines", name=label))
 
-    fig.add_hline(y=80, line_dash="dot", annotation_text="과열 80%")
-    fig.add_hline(y=20, line_dash="dot", annotation_text="침체 20%")
-    fig.update_layout(height=560, yaxis=dict(title="종목 비율(%)", range=[0, 100]), hovermode="x unified")
-    st.plotly_chart(fig, use_container_width=True)
+    breadth_fig.add_hline(y=80, line_dash="dot", annotation_text="과열 80%")
+    breadth_fig.add_hline(y=20, line_dash="dot", annotation_text="침체 20%")
+    breadth_fig.update_layout(
+        title="이동평균선별 Breadth 비교",
+        height=470,
+        yaxis=dict(title="종목 비율(%)", range=[0, 100]),
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.08, x=0),
+    )
+    st.plotly_chart(breadth_fig, use_container_width=True)
 
     left, right = st.columns(2)
     with left:
@@ -1528,6 +1611,61 @@ if run:
         else:
             st.error("시가총액 데이터를 가져오지 못했습니다.")
         st.stop()
+
+    # =========================
+    # 실제 재무 직접 수정 (현재 세션 적용)
+    # =========================
+    override_state_key = f"financial_override_{ticker}"
+
+    if override_state_key in st.session_state:
+        override_df = st.session_state[override_state_key].copy()
+        for _, override_row in override_df.iterrows():
+            override_year = int(override_row["연도"])
+            year_mask = fin_df["year"] == override_year
+            if not year_mask.any():
+                continue
+
+            mapping = {
+                "매출액(억)": "revenue",
+                "영업이익(억)": "operating_income",
+                "당기순이익(억)": "net_income",
+                "자본총계(억)": "equity",
+            }
+            for edit_col, source_col in mapping.items():
+                value = pd.to_numeric(override_row.get(edit_col), errors="coerce")
+                if pd.notna(value):
+                    fin_df.loc[year_mask, source_col] = float(value) * 100_000_000
+
+    with st.expander("✏️ 실제 재무 직접 수정", expanded=False):
+        st.caption(
+            "financial_data.csv 값이 틀릴 때 수정할 수 있습니다. "
+            "수정값은 현재 앱 세션에 즉시 적용되며 앱이 완전히 재시작되면 초기화됩니다."
+        )
+
+        edit_fin = fin_df[["year", "revenue", "operating_income", "net_income", "equity"]].copy()
+        edit_fin.columns = ["연도", "매출액(억)", "영업이익(억)", "당기순이익(억)", "자본총계(억)"]
+        for edit_col in ["매출액(억)", "영업이익(억)", "당기순이익(억)", "자본총계(억)"]:
+            edit_fin[edit_col] = (pd.to_numeric(edit_fin[edit_col], errors="coerce") / 100_000_000).round(1)
+
+        edited_fin = st.data_editor(
+            edit_fin,
+            hide_index=True,
+            disabled=["연도"],
+            use_container_width=True,
+            key=f"financial_editor_{ticker}",
+        )
+
+        apply_col, reset_col = st.columns(2)
+        with apply_col:
+            if st.button("수정값 적용", type="primary", use_container_width=True, key=f"apply_financial_{ticker}"):
+                st.session_state[override_state_key] = edited_fin.copy()
+                st.success("수정값을 적용했습니다.")
+                st.rerun()
+        with reset_col:
+            if st.button("원본값으로 복원", use_container_width=True, key=f"reset_financial_{ticker}"):
+                st.session_state.pop(override_state_key, None)
+                st.success("financial_data.csv 원본값으로 복원했습니다.")
+                st.rerun()
 
     consensus_df = get_consensus_for_ticker(ticker)
 
