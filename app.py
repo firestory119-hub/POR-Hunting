@@ -12,6 +12,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from modules.home import render_home_page
+from modules.dashboard import render_market_dashboard
 
 try:
     from pykrx import stock as krx_stock
@@ -1267,13 +1268,22 @@ sidebar_stock_key = resolve_sidebar_stock_key()
 
 app_page = st.sidebar.radio(
     "메뉴",
-    ["🏠 HOME", "📊 종목 분석", "🌎 Market Breadth"],
+    [
+        "🏠 HOME",
+        "📊 Market Dashboard",
+        "📊 종목 분석",
+        "🌎 Market Breadth",
+    ],
     horizontal=False,
     key="main_page_selector",
 )
 
 if app_page == "🏠 HOME":
     render_home_page(BREADTH_HISTORY_CSV)
+    st.stop()
+
+if app_page == "📊 Market Dashboard":
+    render_market_dashboard(BREADTH_HISTORY_CSV)
     st.stop()
 
 if app_page == "🌎 Market Breadth":
