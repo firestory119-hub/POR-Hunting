@@ -11,13 +11,16 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-
+try:
+    from pykrx import stock as krx_stock
+except Exception:
+    krx_stock = None
 
 
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v41 Per-Stock Inputs", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v42 + Market Breadth", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -29,6 +32,8 @@ FINANCIAL_DATA_CSV = os.path.join(DATA_DIR, "financial_data.csv")
 QUARTERLY_DATA_CSV = os.path.join(DATA_DIR, "financial_quarterly.csv")
 MARKET_HISTORY_CSV = os.path.join(DATA_DIR, "market_history.csv")
 CONSENSUS_XLSX = os.path.join(DATA_DIR, "consensus.xlsx")
+BREADTH_HISTORY_CSV = os.path.join(DATA_DIR, "breadth_history.csv")
+BREADTH_CLOSE_CSV = os.path.join(DATA_DIR, "breadth_close_history.csv")
 GITHUB_OWNER = "firestory119-hub"
 GITHUB_REPO = "POR-Hunting"
 GITHUB_WORKFLOW = "update_one_daily.yml"
@@ -39,8 +44,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 
 
-st.title("POR Hunting Pro v41 Per-Stock Inputs")
-st.caption("즐겨찾기 원키 넘기기 + 종목별 독립 예상 입력")
+st.title("POR Hunting Pro v42 + Market Breadth")
+st.caption("즐겨찾기 원키 넘기기 + 종목별 독립 예상 입력 + 시장 Breadth")
 
 
 # =========================
@@ -1037,7 +1042,143 @@ def resolve_sidebar_stock_key() -> str:
     )[:30] or "default"
 
 
+def load_breadth_history() -> pd.DataFrame:
+    """GitHub Actions 또는 update_breadth.py가 만든 Breadth 이력을 읽습니다."""
+    if not os.path.exists(BREADTH_HISTORY_CSV):
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(BREADTH_HISTORY_CSV)
+    except Exception:
+        return pd.DataFrame()
+
+    if "date" not in df.columns:
+        return pd.DataFrame()
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    numeric_cols = [
+        "above_ma20", "above_ma60", "above_ma120", "above_ma200",
+        "advancers", "decliners", "unchanged", "ad_net", "ad_line",
+        "new_high_52w", "new_low_52w", "index_close",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df.dropna(subset=["date"]).sort_values(["market", "date"]).reset_index(drop=True)
+
+
+def breadth_signal(latest_row: pd.Series) -> tuple[str, str]:
+    score_items = []
+    for col in ["above_ma20", "above_ma60", "above_ma120", "above_ma200"]:
+        value = latest_row.get(col)
+        if pd.notna(value):
+            score_items.append(float(value))
+
+    score = sum(score_items) / len(score_items) if score_items else 50.0
+    ad_net = float(latest_row.get("ad_net", 0) or 0)
+
+    if score >= 70 and ad_net >= 0:
+        return "공격", "상승 참여 종목이 넓게 확산된 강한 장세"
+    if score <= 30 and ad_net < 0:
+        return "방어", "대부분 종목이 약세인 침체·공포 구간"
+    return "중립", "지수와 종목 확산 정도를 함께 확인할 구간"
+
+
+def render_breadth_page():
+    st.title("🌎 Market Breadth")
+    st.caption("코스피·코스닥 시장 내부 강도: 이동평균선 위 종목 비율 + A/D Line + 신고가·신저가")
+
+    df = load_breadth_history()
+    if df.empty:
+        st.warning("data/breadth_history.csv가 아직 없습니다.")
+        st.markdown(
+            "`update_breadth.py`를 한 번 실행하면 약 1년치 자료를 만든 뒤, "
+            "이후에는 신규 거래일만 추가합니다."
+        )
+        st.code("python update_breadth.py", language="bash")
+        return
+
+    market = st.radio("시장", ["KOSPI", "KOSDAQ"], horizontal=True, key="breadth_market")
+    period = st.radio("기간", ["6개월", "1년", "2년", "전체"], index=1, horizontal=True, key="breadth_period")
+
+    mdf = df[df["market"] == market].copy()
+    if mdf.empty:
+        st.warning(f"{market} Breadth 데이터가 없습니다.")
+        return
+
+    latest_date = mdf["date"].max()
+    years_map = {"6개월": 0.5, "1년": 1, "2년": 2}
+    if period in years_map:
+        cutoff = latest_date - pd.DateOffset(months=int(years_map[period] * 12))
+        plot_df = mdf[mdf["date"] >= cutoff].copy()
+    else:
+        plot_df = mdf.copy()
+
+    latest = mdf.iloc[-1]
+    signal, signal_desc = breadth_signal(latest)
+
+    cols = st.columns(6)
+    cols[0].metric("20일선 위", f"{latest.get('above_ma20', float('nan')):.1f}%")
+    cols[1].metric("60일선 위", f"{latest.get('above_ma60', float('nan')):.1f}%")
+    cols[2].metric("120일선 위", f"{latest.get('above_ma120', float('nan')):.1f}%")
+    cols[3].metric("200일선 위", f"{latest.get('above_ma200', float('nan')):.1f}%")
+    cols[4].metric("상승-하락", f"{latest.get('ad_net', 0):,.0f}")
+    cols[5].metric("시장 신호", signal)
+    st.caption(f"기준일 {latest_date:%Y-%m-%d} · {signal_desc}")
+
+    fig = go.Figure()
+    for col, label in [
+        ("above_ma20", "20일선 위 비율"),
+        ("above_ma60", "60일선 위 비율"),
+        ("above_ma120", "120일선 위 비율"),
+        ("above_ma200", "200일선 위 비율"),
+    ]:
+        if col in plot_df.columns:
+            fig.add_trace(go.Scatter(x=plot_df["date"], y=plot_df[col], mode="lines", name=label))
+
+    fig.add_hline(y=80, line_dash="dot", annotation_text="과열 80%")
+    fig.add_hline(y=20, line_dash="dot", annotation_text="침체 20%")
+    fig.update_layout(height=560, yaxis=dict(title="종목 비율(%)", range=[0, 100]), hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
+
+    left, right = st.columns(2)
+    with left:
+        ad_fig = go.Figure()
+        ad_fig.add_trace(go.Scatter(x=plot_df["date"], y=plot_df.get("ad_line"), mode="lines", name="A/D Line"))
+        ad_fig.update_layout(title="누적 A/D Line", height=400, hovermode="x unified")
+        st.plotly_chart(ad_fig, use_container_width=True)
+
+    with right:
+        nhnl_fig = go.Figure()
+        if "new_high_52w" in plot_df.columns:
+            nhnl_fig.add_trace(go.Bar(x=plot_df["date"], y=plot_df["new_high_52w"], name="52주 신고가"))
+        if "new_low_52w" in plot_df.columns:
+            nhnl_fig.add_trace(go.Bar(x=plot_df["date"], y=-plot_df["new_low_52w"], name="52주 신저가"))
+        nhnl_fig.update_layout(title="52주 신고가 / 신저가", height=400, barmode="relative", hovermode="x unified")
+        st.plotly_chart(nhnl_fig, use_container_width=True)
+
+    show_cols = [c for c in [
+        "date", "above_ma20", "above_ma60", "above_ma120", "above_ma200",
+        "advancers", "decliners", "unchanged", "ad_net", "ad_line",
+        "new_high_52w", "new_low_52w",
+    ] if c in mdf.columns]
+    with st.expander("최근 데이터 보기", expanded=False):
+        st.dataframe(mdf[show_cols].tail(30).sort_values("date", ascending=False), use_container_width=True)
+
+
 sidebar_stock_key = resolve_sidebar_stock_key()
+
+app_page = st.sidebar.radio(
+    "메뉴",
+    ["📊 POR 분석", "🌎 Market Breadth"],
+    horizontal=False,
+    key="main_page_selector",
+)
+
+if app_page == "🌎 Market Breadth":
+    render_breadth_page()
+    st.stop()
 
 
 # =========================
