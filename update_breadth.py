@@ -90,7 +90,27 @@ def fetch_naver_history(ticker: str, market: str, count: int) -> pd.DataFrame:
                 timeout=(10, 30),
             )
             response.raise_for_status()
-            root = ET.fromstring(response.content)
+
+            # Naver chart XML declares EUC-KR. Python's built-in Expat parser
+            # can raise "multi-byte encodings are not supported" when the
+            # raw bytes are passed directly. Decode first, remove the XML
+            # declaration, and then parse the Unicode text.
+            raw_bytes = response.content
+            try:
+                xml_text = raw_bytes.decode("euc-kr")
+            except UnicodeDecodeError:
+                try:
+                    xml_text = raw_bytes.decode("cp949")
+                except UnicodeDecodeError:
+                    xml_text = raw_bytes.decode("utf-8", errors="replace")
+
+            xml_text = xml_text.lstrip("\ufeff\r\n\t ")
+            if xml_text.startswith("<?xml"):
+                declaration_end = xml_text.find("?>")
+                if declaration_end >= 0:
+                    xml_text = xml_text[declaration_end + 2:]
+
+            root = ET.fromstring(xml_text)
             rows = []
             for item in root.findall(".//item"):
                 raw = item.attrib.get("data", "")
