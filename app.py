@@ -11,6 +11,8 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from modules.home import render_home_page
+
 try:
     from pykrx import stock as krx_stock
 except Exception:
@@ -20,7 +22,7 @@ except Exception:
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v44 Market Dashboard", layout="wide")
+st.set_page_config(page_title="POR Alpha v45", page_icon="📈", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -44,8 +46,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 
 
-st.title("POR Hunting Pro v44 Market Dashboard")
-st.caption("즐겨찾기 원키 넘기기 + 종목별 독립 예상 입력 + 시장 Breadth")
+st.title("📈 POR Alpha")
+st.caption("Value · Market Breadth · Alpha Dashboard")
 
 
 # =========================
@@ -1265,10 +1267,14 @@ sidebar_stock_key = resolve_sidebar_stock_key()
 
 app_page = st.sidebar.radio(
     "메뉴",
-    ["📊 POR 분석", "🌎 Market Breadth"],
+    ["🏠 HOME", "📊 종목 분석", "🌎 Market Breadth"],
     horizontal=False,
     key="main_page_selector",
 )
+
+if app_page == "🏠 HOME":
+    render_home_page(BREADTH_HISTORY_CSV)
+    st.stop()
 
 if app_page == "🌎 Market Breadth":
     render_breadth_page()
