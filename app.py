@@ -1529,61 +1529,6 @@ if run:
             st.error("시가총액 데이터를 가져오지 못했습니다.")
         st.stop()
 
-    # =========================
-    # 실제 재무 직접 수정 (현재 세션 적용)
-    # =========================
-    override_state_key = f"financial_override_{ticker}"
-
-    if override_state_key in st.session_state:
-        override_df = st.session_state[override_state_key].copy()
-        for _, override_row in override_df.iterrows():
-            override_year = int(override_row["연도"])
-            year_mask = fin_df["year"] == override_year
-            if not year_mask.any():
-                continue
-
-            mapping = {
-                "매출액(억)": "revenue",
-                "영업이익(억)": "operating_income",
-                "당기순이익(억)": "net_income",
-                "자본총계(억)": "equity",
-            }
-            for edit_col, source_col in mapping.items():
-                value = pd.to_numeric(override_row.get(edit_col), errors="coerce")
-                if pd.notna(value):
-                    fin_df.loc[year_mask, source_col] = float(value) * 100_000_000
-
-    with st.expander("✏️ 실제 재무 직접 수정", expanded=False):
-        st.caption(
-            "financial_data.csv 값이 틀릴 때 수정할 수 있습니다. "
-            "수정값은 현재 앱 세션에 즉시 적용되며 앱이 완전히 재시작되면 초기화됩니다."
-        )
-
-        edit_fin = fin_df[["year", "revenue", "operating_income", "net_income", "equity"]].copy()
-        edit_fin.columns = ["연도", "매출액(억)", "영업이익(억)", "당기순이익(억)", "자본총계(억)"]
-        for edit_col in ["매출액(억)", "영업이익(억)", "당기순이익(억)", "자본총계(억)"]:
-            edit_fin[edit_col] = (pd.to_numeric(edit_fin[edit_col], errors="coerce") / 100_000_000).round(1)
-
-        edited_fin = st.data_editor(
-            edit_fin,
-            hide_index=True,
-            disabled=["연도"],
-            use_container_width=True,
-            key=f"financial_editor_{ticker}",
-        )
-
-        apply_col, reset_col = st.columns(2)
-        with apply_col:
-            if st.button("수정값 적용", type="primary", use_container_width=True, key=f"apply_financial_{ticker}"):
-                st.session_state[override_state_key] = edited_fin.copy()
-                st.success("수정값을 적용했습니다.")
-                st.rerun()
-        with reset_col:
-            if st.button("원본값으로 복원", use_container_width=True, key=f"reset_financial_{ticker}"):
-                st.session_state.pop(override_state_key, None)
-                st.success("financial_data.csv 원본값으로 복원했습니다.")
-                st.rerun()
-
     consensus_df = get_consensus_for_ticker(ticker)
 
     applied_forward_year = int(forward_year)
