@@ -20,7 +20,7 @@ except Exception:
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v42 + Market Breadth", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v44 Market Dashboard", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -44,7 +44,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 
 
-st.title("POR Hunting Pro v42 + Market Breadth")
+st.title("POR Hunting Pro v44 Market Dashboard")
 st.caption("즐겨찾기 원키 넘기기 + 종목별 독립 예상 입력 + 시장 Breadth")
 
 
@@ -1068,39 +1068,55 @@ def load_breadth_history() -> pd.DataFrame:
     return df.dropna(subset=["date"]).sort_values(["market", "date"]).reset_index(drop=True)
 
 
-def breadth_signal(latest_row: pd.Series) -> tuple[str, str]:
-    score_items = []
-    for col in ["above_ma20", "above_ma60", "above_ma120", "above_ma200"]:
-        value = latest_row.get(col)
+def breadth_score(latest_row: pd.Series) -> float:
+    """0~100 시장 확산 점수. 단기 35%, 중기 25%, 장기 40% 가중치."""
+    weights = {
+        "above_ma20": 0.35,
+        "above_ma60": 0.25,
+        "above_ma120": 0.20,
+        "above_ma200": 0.20,
+    }
+    score = 0.0
+    used = 0.0
+    for col, weight in weights.items():
+        value = pd.to_numeric(latest_row.get(col), errors="coerce")
         if pd.notna(value):
-            score_items.append(float(value))
+            score += max(0.0, min(100.0, float(value))) * weight
+            used += weight
+    if used == 0:
+        return 50.0
+    return round(score / used, 1)
 
-    score = sum(score_items) / len(score_items) if score_items else 50.0
-    ad_net = float(latest_row.get("ad_net", 0) or 0)
 
-    if score >= 70 and ad_net >= 0:
-        return "공격", "상승 참여 종목이 넓게 확산된 강한 장세"
+def breadth_signal(latest_row: pd.Series) -> tuple[str, str]:
+    score = breadth_score(latest_row)
+    ad_net = float(pd.to_numeric(latest_row.get("ad_net", 0), errors="coerce") or 0)
+    above_200 = float(pd.to_numeric(latest_row.get("above_ma200", 50), errors="coerce") or 50)
+
+    if score >= 70 and ad_net >= 0 and above_200 >= 55:
+        return "공격", "상승 참여 종목이 넓고 장기 추세도 강한 구간"
     if score <= 30 and ad_net < 0:
         return "방어", "대부분 종목이 약세인 침체·공포 구간"
+    if score <= 40 and above_200 <= 25:
+        return "분할관찰", "장기 Breadth가 낮아 바닥 탐색 가능성을 점검할 구간"
     return "중립", "지수와 종목 확산 정도를 함께 확인할 구간"
 
 
 def render_breadth_page():
-    st.title("🌎 Market Breadth")
-    st.caption("코스피·코스닥 시장 내부 강도: 이동평균선 위 종목 비율 + A/D Line + 신고가·신저가")
+    st.title("🌎 Market Breadth Dashboard")
+    st.caption("지수보다 먼저 시장 내부의 확산·과열·침체를 확인하는 POR Hunting 시장 대시보드")
 
     df = load_breadth_history()
     if df.empty:
         st.warning("data/breadth_history.csv가 아직 없습니다.")
-        st.markdown(
-            "`update_breadth.py`를 한 번 실행하면 약 1년치 자료를 만든 뒤, "
-            "이후에는 신규 거래일만 추가합니다."
-        )
-        st.code("python update_breadth.py", language="bash")
+        st.markdown("GitHub Actions의 **Update Market Breadth**를 실행해 데이터를 생성하세요.")
         return
 
-    market = st.radio("시장", ["KOSPI", "KOSDAQ"], horizontal=True, key="breadth_market")
-    period = st.radio("기간", ["6개월", "1년", "2년", "전체"], index=1, horizontal=True, key="breadth_period")
+    top1, top2 = st.columns([1, 3])
+    with top1:
+        market = st.radio("시장", ["KOSPI", "KOSDAQ"], horizontal=True, key="breadth_market")
+    with top2:
+        period = st.radio("기간", ["6개월", "1년", "2년", "전체"], index=1, horizontal=True, key="breadth_period")
 
     mdf = df[df["market"] == market].copy()
     if mdf.empty:
@@ -1108,143 +1124,138 @@ def render_breadth_page():
         return
 
     latest_date = mdf["date"].max()
-    years_map = {"6개월": 0.5, "1년": 1, "2년": 2}
-    if period in years_map:
-        cutoff = latest_date - pd.DateOffset(months=int(years_map[period] * 12))
+    months_map = {"6개월": 6, "1년": 12, "2년": 24}
+    if period in months_map:
+        cutoff = latest_date - pd.DateOffset(months=months_map[period])
         plot_df = mdf[mdf["date"] >= cutoff].copy()
     else:
         plot_df = mdf.copy()
 
     latest = mdf.iloc[-1]
+    previous = mdf.iloc[-2] if len(mdf) > 1 else latest
+    score = breadth_score(latest)
     signal, signal_desc = breadth_signal(latest)
 
-    cols = st.columns(6)
-    cols[0].metric("20일선 위", f"{latest.get('above_ma20', float('nan')):.1f}%")
-    cols[1].metric("60일선 위", f"{latest.get('above_ma60', float('nan')):.1f}%")
-    cols[2].metric("120일선 위", f"{latest.get('above_ma120', float('nan')):.1f}%")
-    cols[3].metric("200일선 위", f"{latest.get('above_ma200', float('nan')):.1f}%")
-    cols[4].metric("상승-하락", f"{latest.get('ad_net', 0):,.0f}")
-    cols[5].metric("시장 신호", signal)
+    metric_cols = st.columns(7)
+    metric_specs = [
+        ("20일선 위", "above_ma20"),
+        ("60일선 위", "above_ma60"),
+        ("120일선 위", "above_ma120"),
+        ("200일선 위", "above_ma200"),
+    ]
+    for box, (label, col) in zip(metric_cols[:4], metric_specs):
+        value = float(pd.to_numeric(latest.get(col), errors="coerce"))
+        prev = float(pd.to_numeric(previous.get(col), errors="coerce"))
+        delta = value - prev if pd.notna(value) and pd.notna(prev) else None
+        box.metric(label, f"{value:.1f}%", f"{delta:+.1f}%p" if delta is not None else None)
+
+    metric_cols[4].metric("시장 점수", f"{score:.1f}/100")
+    metric_cols[5].metric("상승-하락", f"{latest.get('ad_net', 0):,.0f}")
+    metric_cols[6].metric("시장 신호", signal)
+
+    st.progress(int(max(0, min(100, score))))
     st.caption(f"기준일 {latest_date:%Y-%m-%d} · {signal_desc}")
 
-    # Bloomberg 스타일 통합 차트: 지수 + 지수 200일선 + 200일선 위 종목 비율
     combined = plot_df.copy()
     if "index_close" in combined.columns:
         combined["index_ma200"] = combined["index_close"].rolling(200, min_periods=20).mean()
 
     fig = go.Figure()
-
     if "above_ma200" in combined.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=combined["date"],
-                y=combined["above_ma200"],
-                mode="lines",
-                name="200일선 위 종목 비율",
-                fill="tozeroy",
-                opacity=0.48,
-                line=dict(width=1.5),
-                yaxis="y",
-                hovertemplate="%{x|%Y-%m-%d}<br>200일선 위: %{y:.1f}%<extra></extra>",
-            )
-        )
-
+        fig.add_trace(go.Scatter(
+            x=combined["date"], y=combined["above_ma200"], mode="lines",
+            name="200일선 위 종목 비율", fill="tozeroy", opacity=0.42,
+            line=dict(width=1.5), yaxis="y",
+            hovertemplate="%{x|%Y-%m-%d}<br>200일선 위: %{y:.1f}%<extra></extra>",
+        ))
     if "index_close" in combined.columns and combined["index_close"].notna().any():
-        fig.add_trace(
-            go.Scatter(
-                x=combined["date"],
-                y=combined["index_close"],
-                mode="lines",
-                name=f"{market} 지수",
-                line=dict(width=2.2),
-                yaxis="y2",
-                hovertemplate=f"%{{x|%Y-%m-%d}}<br>{market}: %{{y:,.2f}}<extra></extra>",
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=combined["date"],
-                y=combined["index_ma200"],
-                mode="lines",
-                name="지수 200일선",
-                line=dict(width=2),
-                yaxis="y2",
-                hovertemplate="%{x|%Y-%m-%d}<br>지수 200일선: %{y:,.2f}<extra></extra>",
-            )
-        )
-
+        fig.add_trace(go.Scatter(
+            x=combined["date"], y=combined["index_close"], mode="lines",
+            name=f"{market} 지수", line=dict(width=2.4), yaxis="y2",
+            hovertemplate=f"%{{x|%Y-%m-%d}}<br>{market}: %{{y:,.2f}}<extra></extra>",
+        ))
+        fig.add_trace(go.Scatter(
+            x=combined["date"], y=combined["index_ma200"], mode="lines",
+            name="지수 200일선", line=dict(width=2, dash="dash"), yaxis="y2",
+            hovertemplate="%{x|%Y-%m-%d}<br>지수 200일선: %{y:,.2f}<extra></extra>",
+        ))
     if "vkospi" in combined.columns and combined["vkospi"].notna().any():
-        fig.add_trace(
-            go.Scatter(
-                x=combined["date"],
-                y=combined["vkospi"],
-                mode="lines",
-                name="VKOSPI",
-                line=dict(width=1.5, dash="dot"),
-                yaxis="y3",
-                hovertemplate="%{x|%Y-%m-%d}<br>VKOSPI: %{y:.2f}<extra></extra>",
-            )
-        )
+        fig.add_trace(go.Scatter(
+            x=combined["date"], y=combined["vkospi"], mode="lines",
+            name="VKOSPI", line=dict(width=1.5, dash="dot"), yaxis="y3",
+            hovertemplate="%{x|%Y-%m-%d}<br>VKOSPI: %{y:.2f}<extra></extra>",
+        ))
 
+    fig.add_hrect(y0=0, y1=20, fillcolor="rgba(255,99,71,0.08)", line_width=0, yref="y")
+    fig.add_hrect(y0=80, y1=100, fillcolor="rgba(255,165,0,0.08)", line_width=0, yref="y")
     fig.add_hline(y=80, line_dash="dot", annotation_text="과열 80%", yref="y")
     fig.add_hline(y=20, line_dash="dot", annotation_text="침체 20%", yref="y")
     fig.update_layout(
-        title=f"{market} 지수 · 200일선 · Market Breadth",
-        height=650,
-        hovermode="x unified",
+        title=f"{market} 지수 · 200일선 · 장기 Market Breadth",
+        height=600, hovermode="x unified",
         legend=dict(orientation="h", y=1.08, x=0),
-        margin=dict(l=45, r=65, t=90, b=45),
+        margin=dict(l=45, r=70, t=90, b=45),
         yaxis=dict(title="200일선 위 종목 비율(%)", range=[0, 100], side="left"),
         yaxis2=dict(title=f"{market} 지수", overlaying="y", side="right", showgrid=False),
-        yaxis3=dict(title="VKOSPI", overlaying="y", side="right", position=0.93, showgrid=False),
+        yaxis3=dict(title="VKOSPI", overlaying="y", side="right", position=0.94, showgrid=False),
     )
     st.plotly_chart(fig, use_container_width=True)
 
     if "vkospi" not in combined.columns or not combined.get("vkospi", pd.Series(dtype=float)).notna().any():
-        st.caption("※ 현재 데이터에는 VKOSPI가 없어 지수·200일선·Breadth만 표시됩니다. VKOSPI 수집이 추가되면 같은 차트에 자동 표시됩니다.")
+        st.caption("※ VKOSPI 데이터가 추가되면 이 차트에 자동으로 함께 표시됩니다.")
 
-    # 단기·중기 Breadth 비교 차트
+    st.subheader("이동평균선별 시장 확산")
+    gauge_cols = st.columns(4)
+    for box, (label, col) in zip(gauge_cols, metric_specs):
+        value = float(pd.to_numeric(latest.get(col), errors="coerce"))
+        box.markdown(f"**{label}**")
+        box.progress(int(max(0, min(100, value))))
+        box.caption(f"{value:.1f}% · " + ("과열권" if value >= 80 else "침체권" if value <= 20 else "중립권"))
+
     breadth_fig = go.Figure()
     for col, label in [
-        ("above_ma20", "20일선 위 비율"),
-        ("above_ma60", "60일선 위 비율"),
-        ("above_ma120", "120일선 위 비율"),
-        ("above_ma200", "200일선 위 비율"),
+        ("above_ma20", "20일선 위"), ("above_ma60", "60일선 위"),
+        ("above_ma120", "120일선 위"), ("above_ma200", "200일선 위"),
     ]:
         if col in plot_df.columns:
             breadth_fig.add_trace(go.Scatter(x=plot_df["date"], y=plot_df[col], mode="lines", name=label))
-
-    breadth_fig.add_hline(y=80, line_dash="dot", annotation_text="과열 80%")
-    breadth_fig.add_hline(y=20, line_dash="dot", annotation_text="침체 20%")
-    breadth_fig.update_layout(
-        title="이동평균선별 Breadth 비교",
-        height=470,
-        yaxis=dict(title="종목 비율(%)", range=[0, 100]),
-        hovermode="x unified",
-        legend=dict(orientation="h", y=1.08, x=0),
-    )
+    breadth_fig.add_hline(y=80, line_dash="dot", annotation_text="과열")
+    breadth_fig.add_hline(y=20, line_dash="dot", annotation_text="침체")
+    breadth_fig.update_layout(height=420, yaxis=dict(title="종목 비율(%)", range=[0, 100]), hovermode="x unified", legend=dict(orientation="h", y=1.08, x=0))
     st.plotly_chart(breadth_fig, use_container_width=True)
 
     left, right = st.columns(2)
     with left:
         ad_fig = go.Figure()
-        ad_fig.add_trace(go.Scatter(x=plot_df["date"], y=plot_df.get("ad_line"), mode="lines", name="A/D Line"))
-        ad_fig.update_layout(title="누적 A/D Line", height=400, hovermode="x unified")
+        if "ad_line" in plot_df.columns:
+            ad_fig.add_trace(go.Scatter(x=plot_df["date"], y=plot_df["ad_line"], mode="lines", name="A/D Line"))
+        ad_fig.update_layout(title="누적 A/D Line", height=360, hovermode="x unified")
         st.plotly_chart(ad_fig, use_container_width=True)
-
     with right:
         nhnl_fig = go.Figure()
         if "new_high_52w" in plot_df.columns:
             nhnl_fig.add_trace(go.Bar(x=plot_df["date"], y=plot_df["new_high_52w"], name="52주 신고가"))
         if "new_low_52w" in plot_df.columns:
             nhnl_fig.add_trace(go.Bar(x=plot_df["date"], y=-plot_df["new_low_52w"], name="52주 신저가"))
-        nhnl_fig.update_layout(title="52주 신고가 / 신저가", height=400, barmode="relative", hovermode="x unified")
+        nhnl_fig.update_layout(title="52주 신고가 / 신저가", height=360, barmode="relative", hovermode="x unified")
         st.plotly_chart(nhnl_fig, use_container_width=True)
+
+    with st.expander("📌 현재 시장 해석", expanded=True):
+        ma20 = float(pd.to_numeric(latest.get("above_ma20"), errors="coerce"))
+        ma200 = float(pd.to_numeric(latest.get("above_ma200"), errors="coerce"))
+        if ma20 >= 60 and ma200 < 35:
+            st.info("단기 반등은 강하지만 장기 추세 회복은 아직 제한적입니다. 추격보다 눌림 확인이 유리한 구조입니다.")
+        elif ma20 <= 20 and ma200 <= 25:
+            st.warning("단기·장기 Breadth가 동시에 침체권입니다. 공포 구간일 수 있으나 추가 하락 가능성도 있어 분할 접근이 적합합니다.")
+        elif ma20 >= 70 and ma200 >= 60:
+            st.success("단기와 장기 상승 참여가 모두 넓습니다. 추세가 강하지만 80% 이상에서는 과열 여부를 함께 점검하세요.")
+        else:
+            st.write("시장 내부가 혼조입니다. 지수 방향보다 60일·200일 Breadth의 개선 지속 여부를 확인하세요.")
 
     show_cols = [c for c in [
         "date", "above_ma20", "above_ma60", "above_ma120", "above_ma200",
         "advancers", "decliners", "unchanged", "ad_net", "ad_line",
-        "new_high_52w", "new_low_52w",
+        "new_high_52w", "new_low_52w", "index_close",
     ] if c in mdf.columns]
     with st.expander("최근 데이터 보기", expanded=False):
         st.dataframe(mdf[show_cols].tail(30).sort_values("date", ascending=False), use_container_width=True)
