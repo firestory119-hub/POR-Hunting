@@ -1,108 +1,178 @@
 import os
 import time
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 import pandas as pd
-from pykrx import stock
+import requests
+
+try:
+    from pykrx import stock
+except Exception:
+    stock = None
+
+try:
+    import FinanceDataReader as fdr
+except Exception:
+    fdr = None
 
 DATA_DIR = "data"
 CLOSE_FILE = os.path.join(DATA_DIR, "breadth_close_history.csv")
 OUTPUT_FILE = os.path.join(DATA_DIR, "breadth_history.csv")
 LOOKBACK_CALENDAR_DAYS = 430
 MARKETS = ["KOSPI", "KOSDAQ"]
+MAX_WORKERS = 10
+NAVER_CHART_URL = "https://fchart.stock.naver.com/sise.nhn"
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
+def clean_ticker(value) -> str:
+    return str(value).strip().replace(".0", "").zfill(6)
+
+
 def load_close_history() -> pd.DataFrame:
+    cols = ["date", "market", "ticker", "close", "change"]
     if not os.path.exists(CLOSE_FILE):
-        return pd.DataFrame(columns=["date", "market", "ticker", "close", "change"])
+        return pd.DataFrame(columns=cols)
     df = pd.read_csv(CLOSE_FILE, dtype={"ticker": str})
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["ticker"] = df["ticker"].astype(str).str.zfill(6)
+    df["ticker"] = df["ticker"].map(clean_ticker)
     for col in ["close", "change"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df.dropna(subset=["date", "market", "ticker", "close"])
+    return df.dropna(subset=["date", "market", "ticker", "close"])[cols]
 
 
-def business_dates(start: str, end: str) -> list[pd.Timestamp]:
-    try:
-        dates = stock.get_previous_business_days(fromdate=start, todate=end)
-        return [pd.Timestamp(d) for d in dates]
-    except Exception:
-        return list(pd.bdate_range(pd.to_datetime(start), pd.to_datetime(end)))
+def get_market_tickers(market: str) -> list[str]:
+    today = datetime.today().strftime("%Y%m%d")
+
+    if stock is not None:
+        try:
+            tickers = stock.get_market_ticker_list(today, market=market)
+            if tickers:
+                return sorted({clean_ticker(x) for x in tickers})
+        except Exception as exc:
+            print(f"pykrx {market} 종목목록 실패: {exc}", flush=True)
+
+    if fdr is not None:
+        try:
+            listing = fdr.StockListing(market)
+            code_col = "Code" if "Code" in listing.columns else "Symbol"
+            tickers = listing[code_col].dropna().map(clean_ticker).tolist()
+            if tickers:
+                return sorted(set(tickers))
+        except Exception as exc:
+            print(f"FinanceDataReader {market} 종목목록 실패: {exc}", flush=True)
+
+    raise RuntimeError(f"{market} 종목 목록을 가져오지 못했습니다.")
 
 
-def fetch_cross_section(date: pd.Timestamp, market: str) -> pd.DataFrame:
-    ds = date.strftime("%Y%m%d")
-    frame = stock.get_market_ohlcv_by_ticker(ds, market=market)
-    if frame is None or frame.empty:
-        return pd.DataFrame()
+def fetch_naver_history(ticker: str, market: str, count: int) -> pd.DataFrame:
+    params = {
+        "symbol": ticker,
+        "timeframe": "day",
+        "count": str(count),
+        "requestType": "0",
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": f"https://finance.naver.com/item/main.naver?code={ticker}",
+    }
 
-    frame = frame.reset_index()
-    ticker_col = frame.columns[0]
-    close_col = "종가" if "종가" in frame.columns else None
-    change_col = "등락률" if "등락률" in frame.columns else None
-    if close_col is None:
-        return pd.DataFrame()
+    last_error = None
+    for attempt in range(4):
+        try:
+            response = requests.get(
+                NAVER_CHART_URL,
+                params=params,
+                headers=headers,
+                timeout=(10, 30),
+            )
+            response.raise_for_status()
+            root = ET.fromstring(response.content)
+            rows = []
+            for item in root.findall(".//item"):
+                raw = item.attrib.get("data", "")
+                parts = raw.split("|")
+                if len(parts) < 6:
+                    continue
+                date_text, _open, _high, _low, close, _volume = parts[:6]
+                rows.append({
+                    "date": pd.to_datetime(date_text, format="%Y%m%d", errors="coerce"),
+                    "market": market,
+                    "ticker": ticker,
+                    "close": pd.to_numeric(close, errors="coerce"),
+                })
 
-    out = pd.DataFrame({
-        "date": date,
-        "market": market,
-        "ticker": frame[ticker_col].astype(str).str.zfill(6),
-        "close": pd.to_numeric(frame[close_col], errors="coerce"),
-        "change": pd.to_numeric(frame[change_col], errors="coerce") if change_col else 0.0,
-    })
-    return out[out["close"] > 0].dropna(subset=["close"])
+            frame = pd.DataFrame(rows)
+            if frame.empty:
+                return pd.DataFrame(columns=["date", "market", "ticker", "close", "change"])
+
+            frame = frame.dropna(subset=["date", "close"]).sort_values("date")
+            frame = frame[frame["close"] > 0]
+            frame["change"] = frame["close"].pct_change() * 100
+            return frame[["date", "market", "ticker", "close", "change"]]
+        except Exception as exc:
+            last_error = exc
+            time.sleep(1.5 * (attempt + 1))
+
+    print(f"{market} {ticker} 수집 실패: {last_error}", flush=True)
+    return pd.DataFrame(columns=["date", "market", "ticker", "close", "change"])
 
 
 def update_close_history() -> pd.DataFrame:
     old = load_close_history()
-    end = datetime.today().date()
+    end = pd.Timestamp.today().normalize()
+    cutoff = end - pd.Timedelta(days=LOOKBACK_CALENDAR_DAYS)
 
     if old.empty:
-        start = end - timedelta(days=LOOKBACK_CALENDAR_DAYS)
+        request_count = 330
     else:
-        start = old["date"].max().date() + timedelta(days=1)
+        missing_calendar_days = max(7, (end - old["date"].max()).days + 7)
+        request_count = min(330, max(15, int(missing_calendar_days * 0.75) + 10))
 
-    if start > end:
-        return old
+    jobs = []
+    for market in MARKETS:
+        tickers = get_market_tickers(market)
+        print(f"{market}: {len(tickers):,}개 종목", flush=True)
+        jobs.extend((ticker, market) for ticker in tickers)
 
-    dates = business_dates(start.strftime("%Y%m%d"), end.strftime("%Y%m%d"))
     new_frames = []
-
-    total = len(dates) * len(MARKETS)
-    done = 0
-    for date in dates:
-        for market in MARKETS:
-            done += 1
+    total = len(jobs)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(fetch_naver_history, ticker, market, request_count): (ticker, market)
+            for ticker, market in jobs
+        }
+        for idx, future in enumerate(as_completed(futures), start=1):
+            ticker, market = futures[future]
             try:
-                frame = fetch_cross_section(date, market)
+                frame = future.result()
                 if not frame.empty:
                     new_frames.append(frame)
-                print(f"[{done}/{total}] {date.date()} {market}: {len(frame)}")
             except Exception as exc:
-                print(f"[{done}/{total}] {date.date()} {market} 실패: {exc}")
-            time.sleep(0.08)
+                print(f"[{idx}/{total}] {market} {ticker} 실패: {exc}", flush=True)
+            if idx % 100 == 0 or idx == total:
+                print(f"수집 진행: {idx:,}/{total:,}", flush=True)
 
-    if new_frames:
-        new = pd.concat(new_frames, ignore_index=True)
-        all_df = pd.concat([old, new], ignore_index=True)
-    else:
-        all_df = old.copy()
+    if not new_frames and old.empty:
+        raise RuntimeError("네이버에서도 종가 데이터를 수집하지 못했습니다.")
 
+    all_df = pd.concat([old] + new_frames, ignore_index=True)
+    all_df = all_df[all_df["date"] >= cutoff]
     all_df = (
         all_df.drop_duplicates(["date", "market", "ticker"], keep="last")
         .sort_values(["market", "ticker", "date"])
         .reset_index(drop=True)
     )
+    all_df["change"] = all_df.groupby(["market", "ticker"])["close"].pct_change() * 100
     all_df.to_csv(CLOSE_FILE, index=False, encoding="utf-8-sig")
     return all_df
 
 
 def calculate_breadth(close_df: pd.DataFrame) -> pd.DataFrame:
     rows = []
-
     for market in MARKETS:
         m = close_df[close_df["market"] == market].copy()
         if m.empty:
@@ -110,30 +180,22 @@ def calculate_breadth(close_df: pd.DataFrame) -> pd.DataFrame:
 
         m = m.sort_values(["ticker", "date"])
         for window in [20, 60, 120, 200]:
-            m[f"ma{window}"] = (
-                m.groupby("ticker", group_keys=False)["close"]
-                .transform(lambda s: s.rolling(window, min_periods=window).mean())
+            m[f"ma{window}"] = m.groupby("ticker")["close"].transform(
+                lambda s, w=window: s.rolling(w, min_periods=w).mean()
             )
 
-        m["high_252"] = (
-            m.groupby("ticker", group_keys=False)["close"]
-            .transform(lambda s: s.rolling(252, min_periods=120).max())
+        m["high_252"] = m.groupby("ticker")["close"].transform(
+            lambda s: s.rolling(252, min_periods=120).max()
         )
-        m["low_252"] = (
-            m.groupby("ticker", group_keys=False)["close"]
-            .transform(lambda s: s.rolling(252, min_periods=120).min())
+        m["low_252"] = m.groupby("ticker")["close"].transform(
+            lambda s: s.rolling(252, min_periods=120).min()
         )
 
-        grouped = m.groupby("date", sort=True)
         ad_line = 0
-        for date, day in grouped:
-            valid_count = len(day)
-            if valid_count == 0:
-                continue
-
+        for date, day in m.groupby("date", sort=True):
             advancers = int((day["change"] > 0).sum())
             decliners = int((day["change"] < 0).sum())
-            unchanged = int((day["change"] == 0).sum())
+            unchanged = int((day["change"].fillna(0) == 0).sum())
             ad_net = advancers - decliners
             ad_line += ad_net
 
@@ -148,7 +210,6 @@ def calculate_breadth(close_df: pd.DataFrame) -> pd.DataFrame:
                 "new_high_52w": int((day["close"] >= day["high_252"]).fillna(False).sum()),
                 "new_low_52w": int((day["close"] <= day["low_252"]).fillna(False).sum()),
             }
-
             for window in [20, 60, 120, 200]:
                 ma = day[f"ma{window}"]
                 valid = ma.notna()
@@ -156,8 +217,10 @@ def calculate_breadth(close_df: pd.DataFrame) -> pd.DataFrame:
                     float((day.loc[valid, "close"] > ma.loc[valid]).mean() * 100)
                     if valid.any() else None
                 )
-
             rows.append(row)
+
+    if not rows:
+        raise RuntimeError("Breadth 계산 결과가 없습니다.")
 
     out = pd.DataFrame(rows).sort_values(["market", "date"])
     out.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
@@ -166,10 +229,8 @@ def calculate_breadth(close_df: pd.DataFrame) -> pd.DataFrame:
 
 def main():
     close_df = update_close_history()
-    if close_df.empty:
-        raise RuntimeError("수집된 종가 데이터가 없습니다.")
     result = calculate_breadth(close_df)
-    print(f"완료: {OUTPUT_FILE} ({len(result)}행)")
+    print(f"완료: {OUTPUT_FILE} ({len(result):,}행)", flush=True)
 
 
 if __name__ == "__main__":
