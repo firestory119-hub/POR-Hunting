@@ -1,7 +1,7 @@
 import streamlit as st
 
 
-def show_home():
+def render_home_page(breadth_csv=None):
     st.title("🏠 POR Alpha")
 
     st.caption("Value + Market Breadth + AI Dashboard")
