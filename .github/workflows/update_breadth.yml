@@ -11,13 +11,16 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install pandas pykrx
-      - run: python update_breadth.py
+      - name: Install packages
+        run: pip install pandas requests pykrx finance-datareader
+      - name: Build breadth data
+        run: python update_breadth.py
       - name: Commit breadth data
         run: |
           git config user.name "github-actions[bot]"
