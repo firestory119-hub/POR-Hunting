@@ -11,16 +11,13 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-try:
-    from pykrx import stock as krx_stock
-except Exception:
-    krx_stock = None
+
 
 
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Hunting Pro v42 + Market Breadth", layout="wide")
+st.set_page_config(page_title="POR Hunting Pro v40 Favorite Reset", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -32,8 +29,6 @@ FINANCIAL_DATA_CSV = os.path.join(DATA_DIR, "financial_data.csv")
 QUARTERLY_DATA_CSV = os.path.join(DATA_DIR, "financial_quarterly.csv")
 MARKET_HISTORY_CSV = os.path.join(DATA_DIR, "market_history.csv")
 CONSENSUS_XLSX = os.path.join(DATA_DIR, "consensus.xlsx")
-BREADTH_HISTORY_CSV = os.path.join(DATA_DIR, "breadth_history.csv")
-BREADTH_CLOSE_CSV = os.path.join(DATA_DIR, "breadth_close_history.csv")
 GITHUB_OWNER = "firestory119-hub"
 GITHUB_REPO = "POR-Hunting"
 GITHUB_WORKFLOW = "update_one_daily.yml"
@@ -44,8 +39,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 
 
-st.title("POR Hunting Pro v42 + Market Breadth")
-st.caption("즐겨찾기 원키 넘기기 + 종목별 독립 예상 입력 + 시장 Breadth")
+st.title("POR Hunting Pro v40 Favorite Reset")
+st.caption("즐겨찾기 원키 넘기기 + 종목 변경 시 예상값 자동 초기화")
 
 
 # =========================
@@ -899,288 +894,6 @@ def plot_valuation(val_df: pd.DataFrame, title: str, metric: str, chart_range: s
     return fig, mean, std, len(plot_df), base_date, plot_df
 
 
-def reset_manual_projection_inputs():
-    """
-    현재 세션의 수동 예상 입력 위젯 상태를 정리합니다.
-    V41부터 종목별 동적 키를 사용하므로 다른 종목 값이 섞이지 않습니다.
-    """
-    prefixes = (
-        "forward_year_input",
-        "forward_oi_input",
-        "expected_mcap_input",
-        "expected_price_input",
-    )
-
-    for key in list(st.session_state.keys()):
-        if any(
-            key == prefix or key.startswith(f"{prefix}_")
-            for prefix in prefixes
-        ):
-            st.session_state.pop(key, None)
-
-
-def navigate_favorite(direction: int, favorite_rows: list[dict]):
-    """
-    Streamlit 버튼 콜백.
-    콜백은 새 화면을 그리기 전에 실행되므로 예상 입력값이 확실히 초기화됩니다.
-    """
-    if not favorite_rows:
-        return
-
-    count = len(favorite_rows)
-    current_index = int(
-        st.session_state.get("favorite_nav_index", 0)
-    )
-    next_index = (current_index + int(direction)) % count
-    selected = favorite_rows[next_index]
-
-    reset_manual_projection_inputs()
-
-    st.session_state["favorite_nav_index"] = next_index
-    st.session_state["stock_query"] = selected["name"]
-    st.session_state["_favorite_nav_ticker"] = selected["ticker"]
-
-    # 빠른 선택 드롭다운과 충돌하지 않도록 직접 입력으로 되돌립니다.
-    st.session_state["quick_stock_select"] = "직접 입력"
-    st.session_state["_last_quick_selection"] = "직접 입력"
-
-
-def apply_quick_selection(quick_map: dict):
-    """빠른 선택 변경 콜백."""
-    selected = st.session_state.get(
-        "quick_stock_select",
-        "직접 입력",
-    )
-
-    if selected == "직접 입력":
-        return
-
-    selected_name = quick_map.get(selected)
-    if not selected_name:
-        return
-
-    reset_manual_projection_inputs()
-    st.session_state["stock_query"] = selected_name
-    st.session_state["_last_quick_selection"] = selected
-
-
-def on_stock_query_change():
-    """검색창에서 다른 종목을 입력할 때 수동 예상값을 초기화합니다."""
-    current_query = str(
-        st.session_state.get("stock_query", "")
-    ).strip()
-
-    previous_query = str(
-        st.session_state.get("_last_stock_query", "")
-    ).strip()
-
-    if previous_query and current_query != previous_query:
-        reset_manual_projection_inputs()
-
-    st.session_state["_last_stock_query"] = current_query
-
-
-
-def resolve_sidebar_stock_key() -> str:
-    """
-    사이드바 위젯 키에 사용할 현재 종목코드를 미리 찾습니다.
-    즐겨찾기/빠른선택/검색창 변경 후 새 종목코드가 곧바로 반영되므로,
-    종목마다 서로 다른 예상 입력 위젯 상태를 사용합니다.
-    """
-    query_value = str(
-        st.session_state.get(
-            "stock_query",
-            _query_value("collecting_name", "삼성전자"),
-        )
-    ).strip()
-
-    if not query_value:
-        return "default"
-
-    try:
-        market = _load_market_csv()
-    except Exception:
-        return re.sub(r"[^0-9A-Za-z가-힣]", "_", query_value)[:30] or "default"
-
-    code_query = (
-        query_value.replace(".0", "")
-        if query_value
-        else ""
-    )
-
-    if code_query.isdigit():
-        code_query = code_query.zfill(6)
-        exact_code = market[
-            market["종목코드"].astype(str) == code_query
-        ]
-        if not exact_code.empty:
-            return str(exact_code.iloc[0]["종목코드"])
-
-    exact_name = market[
-        market["종목명"].astype(str).str.lower()
-        == query_value.lower()
-    ]
-    if not exact_name.empty:
-        return str(exact_name.iloc[0]["종목코드"])
-
-    contains_name = market[
-        market["종목명"]
-        .astype(str)
-        .str.lower()
-        .str.contains(
-            re.escape(query_value.lower()),
-            na=False,
-        )
-    ]
-    if not contains_name.empty:
-        return str(contains_name.iloc[0]["종목코드"])
-
-    return re.sub(
-        r"[^0-9A-Za-z가-힣]",
-        "_",
-        query_value,
-    )[:30] or "default"
-
-
-def load_breadth_history() -> pd.DataFrame:
-    """GitHub Actions 또는 update_breadth.py가 만든 Breadth 이력을 읽습니다."""
-    if not os.path.exists(BREADTH_HISTORY_CSV):
-        return pd.DataFrame()
-
-    try:
-        df = pd.read_csv(BREADTH_HISTORY_CSV)
-    except Exception:
-        return pd.DataFrame()
-
-    if "date" not in df.columns:
-        return pd.DataFrame()
-
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    numeric_cols = [
-        "above_ma20", "above_ma60", "above_ma120", "above_ma200",
-        "advancers", "decliners", "unchanged", "ad_net", "ad_line",
-        "new_high_52w", "new_low_52w", "index_close",
-    ]
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    return df.dropna(subset=["date"]).sort_values(["market", "date"]).reset_index(drop=True)
-
-
-def breadth_signal(latest_row: pd.Series) -> tuple[str, str]:
-    score_items = []
-    for col in ["above_ma20", "above_ma60", "above_ma120", "above_ma200"]:
-        value = latest_row.get(col)
-        if pd.notna(value):
-            score_items.append(float(value))
-
-    score = sum(score_items) / len(score_items) if score_items else 50.0
-    ad_net = float(latest_row.get("ad_net", 0) or 0)
-
-    if score >= 70 and ad_net >= 0:
-        return "공격", "상승 참여 종목이 넓게 확산된 강한 장세"
-    if score <= 30 and ad_net < 0:
-        return "방어", "대부분 종목이 약세인 침체·공포 구간"
-    return "중립", "지수와 종목 확산 정도를 함께 확인할 구간"
-
-
-def render_breadth_page():
-    st.title("🌎 Market Breadth")
-    st.caption("코스피·코스닥 시장 내부 강도: 이동평균선 위 종목 비율 + A/D Line + 신고가·신저가")
-
-    df = load_breadth_history()
-    if df.empty:
-        st.warning("data/breadth_history.csv가 아직 없습니다.")
-        st.markdown(
-            "`update_breadth.py`를 한 번 실행하면 약 1년치 자료를 만든 뒤, "
-            "이후에는 신규 거래일만 추가합니다."
-        )
-        st.code("python update_breadth.py", language="bash")
-        return
-
-    market = st.radio("시장", ["KOSPI", "KOSDAQ"], horizontal=True, key="breadth_market")
-    period = st.radio("기간", ["6개월", "1년", "2년", "전체"], index=1, horizontal=True, key="breadth_period")
-
-    mdf = df[df["market"] == market].copy()
-    if mdf.empty:
-        st.warning(f"{market} Breadth 데이터가 없습니다.")
-        return
-
-    latest_date = mdf["date"].max()
-    years_map = {"6개월": 0.5, "1년": 1, "2년": 2}
-    if period in years_map:
-        cutoff = latest_date - pd.DateOffset(months=int(years_map[period] * 12))
-        plot_df = mdf[mdf["date"] >= cutoff].copy()
-    else:
-        plot_df = mdf.copy()
-
-    latest = mdf.iloc[-1]
-    signal, signal_desc = breadth_signal(latest)
-
-    cols = st.columns(6)
-    cols[0].metric("20일선 위", f"{latest.get('above_ma20', float('nan')):.1f}%")
-    cols[1].metric("60일선 위", f"{latest.get('above_ma60', float('nan')):.1f}%")
-    cols[2].metric("120일선 위", f"{latest.get('above_ma120', float('nan')):.1f}%")
-    cols[3].metric("200일선 위", f"{latest.get('above_ma200', float('nan')):.1f}%")
-    cols[4].metric("상승-하락", f"{latest.get('ad_net', 0):,.0f}")
-    cols[5].metric("시장 신호", signal)
-    st.caption(f"기준일 {latest_date:%Y-%m-%d} · {signal_desc}")
-
-    fig = go.Figure()
-    for col, label in [
-        ("above_ma20", "20일선 위 비율"),
-        ("above_ma60", "60일선 위 비율"),
-        ("above_ma120", "120일선 위 비율"),
-        ("above_ma200", "200일선 위 비율"),
-    ]:
-        if col in plot_df.columns:
-            fig.add_trace(go.Scatter(x=plot_df["date"], y=plot_df[col], mode="lines", name=label))
-
-    fig.add_hline(y=80, line_dash="dot", annotation_text="과열 80%")
-    fig.add_hline(y=20, line_dash="dot", annotation_text="침체 20%")
-    fig.update_layout(height=560, yaxis=dict(title="종목 비율(%)", range=[0, 100]), hovermode="x unified")
-    st.plotly_chart(fig, use_container_width=True)
-
-    left, right = st.columns(2)
-    with left:
-        ad_fig = go.Figure()
-        ad_fig.add_trace(go.Scatter(x=plot_df["date"], y=plot_df.get("ad_line"), mode="lines", name="A/D Line"))
-        ad_fig.update_layout(title="누적 A/D Line", height=400, hovermode="x unified")
-        st.plotly_chart(ad_fig, use_container_width=True)
-
-    with right:
-        nhnl_fig = go.Figure()
-        if "new_high_52w" in plot_df.columns:
-            nhnl_fig.add_trace(go.Bar(x=plot_df["date"], y=plot_df["new_high_52w"], name="52주 신고가"))
-        if "new_low_52w" in plot_df.columns:
-            nhnl_fig.add_trace(go.Bar(x=plot_df["date"], y=-plot_df["new_low_52w"], name="52주 신저가"))
-        nhnl_fig.update_layout(title="52주 신고가 / 신저가", height=400, barmode="relative", hovermode="x unified")
-        st.plotly_chart(nhnl_fig, use_container_width=True)
-
-    show_cols = [c for c in [
-        "date", "above_ma20", "above_ma60", "above_ma120", "above_ma200",
-        "advancers", "decliners", "unchanged", "ad_net", "ad_line",
-        "new_high_52w", "new_low_52w",
-    ] if c in mdf.columns]
-    with st.expander("최근 데이터 보기", expanded=False):
-        st.dataframe(mdf[show_cols].tail(30).sort_values("date", ascending=False), use_container_width=True)
-
-
-sidebar_stock_key = resolve_sidebar_stock_key()
-
-app_page = st.sidebar.radio(
-    "메뉴",
-    ["📊 POR 분석", "🌎 Market Breadth"],
-    horizontal=False,
-    key="main_page_selector",
-)
-
-if app_page == "🌎 Market Breadth":
-    render_breadth_page()
-    st.stop()
-
-
 # =========================
 # 사이드바
 # =========================
@@ -1221,8 +934,6 @@ with st.sidebar:
         ["직접 입력"] + quick_options,
         index=0,
         key="quick_stock_select",
-        on_change=apply_quick_selection,
-        args=(quick_map,),
     )
 
     # V39: 즐겨찾기 원키 넘기기
@@ -1256,13 +967,26 @@ with st.sidebar:
         )
 
         with nav_prev:
-            st.button(
+            if st.button(
                 "◀ 이전",
                 use_container_width=True,
                 key="favorite_prev_button",
-                on_click=navigate_favorite,
-                args=(-1, favorite_rows),
-            )
+            ):
+                next_index = (
+                    current_favorite_index - 1
+                ) % favorite_count
+                selected_favorite = favorite_rows[next_index]
+
+                st.session_state["favorite_nav_index"] = (
+                    next_index
+                )
+                st.session_state["_favorite_nav_name"] = (
+                    selected_favorite["name"]
+                )
+                st.session_state["_favorite_nav_ticker"] = (
+                    selected_favorite["ticker"]
+                )
+                st.rerun()
 
         with nav_count:
             st.markdown(
@@ -1277,14 +1001,27 @@ with st.sidebar:
             )
 
         with nav_next:
-            st.button(
+            if st.button(
                 "다음 ▶",
                 use_container_width=True,
                 type="primary",
                 key="favorite_next_button",
-                on_click=navigate_favorite,
-                args=(1, favorite_rows),
-            )
+            ):
+                next_index = (
+                    current_favorite_index + 1
+                ) % favorite_count
+                selected_favorite = favorite_rows[next_index]
+
+                st.session_state["favorite_nav_index"] = (
+                    next_index
+                )
+                st.session_state["_favorite_nav_name"] = (
+                    selected_favorite["name"]
+                )
+                st.session_state["_favorite_nav_ticker"] = (
+                    selected_favorite["ticker"]
+                )
+                st.rerun()
 
         current_favorite = favorite_rows[
             st.session_state["favorite_nav_index"]
@@ -1333,7 +1070,7 @@ with st.sidebar:
         min_value=2020,
         max_value=2035,
         step=1,
-        key=f"forward_year_input_{sidebar_stock_key}",
+        key="forward_year_input",
     )
 
     if valuation_metric == "POR":
@@ -1347,19 +1084,19 @@ with st.sidebar:
         f"{expected_base_label}(억원, 선택)",
         value=0.0,
         step=10.0,
-        key=f"forward_oi_input_{sidebar_stock_key}",
+        key="forward_oi_input",
     )
     expected_mcap_eok = st.number_input(
         "예상 시가총액(억원, 선택)",
         value=0.0,
         step=50.0,
-        key=f"expected_mcap_input_{sidebar_stock_key}",
+        key="expected_mcap_input",
     )
     expected_price = st.number_input(
         "예상 주가(원, 선택)",
         value=0.0,
         step=100.0,
-        key=f"expected_price_input_{sidebar_stock_key}",
+        key="expected_price_input",
     )
     target_por_slider = st.slider(f"목표 {valuation_metric}", 1.0, 30.0, 8.0, 0.5)
     bear_por = st.number_input("보수 POR", value=5.0, step=0.5)
@@ -1378,22 +1115,51 @@ default_query = _query_value(
     "삼성전자",
 )
 
+# 즐겨찾기 이전/다음 버튼에서 넘어온 종목을 최우선 적용
+favorite_nav_name = st.session_state.pop(
+    "_favorite_nav_name",
+    None,
+)
+
+if favorite_nav_name:
+    st.session_state["stock_query"] = (
+        favorite_nav_name
+    )
+else:
+    try:
+        if selected_quick != "직접 입력":
+            selected_quick_name = quick_map.get(
+                selected_quick,
+                "삼성전자",
+            )
+
+            if (
+                st.session_state.get(
+                    "_last_quick_selection"
+                )
+                != selected_quick
+            ):
+                st.session_state["stock_query"] = (
+                    selected_quick_name
+                )
+                st.session_state[
+                    "_last_quick_selection"
+                ] = selected_quick
+    except Exception:
+        pass
+
 if "stock_query" not in st.session_state:
     st.session_state["stock_query"] = default_query
 
 query = st.text_input(
     "Stock Name",
     key="stock_query",
-    on_change=on_stock_query_change,
     help=(
         "종목명을 입력하고 엔터를 누르면 자동으로 조회됩니다. "
         "즐겨찾기는 사이드바의 ◀ 이전 / 다음 ▶ 버튼으로 "
         "즉시 넘길 수 있습니다."
     ),
 )
-
-if "_last_stock_query" not in st.session_state:
-    st.session_state["_last_stock_query"] = query
 
 run = bool(query.strip())
 
@@ -1433,24 +1199,16 @@ if run:
     corp_code = ""
     name = row["corp_name"]
 
-    # 검색 결과에서 선택한 종목과 사이드바 위젯 종목키가 다르면
-    # 검색어를 정확한 종목명으로 맞춘 뒤 한 번만 재실행합니다.
-    if str(sidebar_stock_key) != str(ticker):
-        sync_guard = st.session_state.get(
-            "_sidebar_stock_sync_guard"
-        )
+    # V40: 다른 종목으로 넘어가면 수동 예상값 자동 초기화
+    previous_ticker = st.session_state.get("_active_stock_ticker")
 
-        if sync_guard != str(ticker):
-            st.session_state[
-                "_sidebar_stock_sync_guard"
-            ] = str(ticker)
-            st.session_state["stock_query"] = name
-            st.rerun()
-    else:
-        st.session_state.pop(
-            "_sidebar_stock_sync_guard",
-            None,
-        )
+    if previous_ticker is not None and previous_ticker != ticker:
+        st.session_state["forward_year_input"] = datetime.today().year
+        st.session_state["forward_oi_input"] = 0.0
+        st.session_state["expected_mcap_input"] = 0.0
+        st.session_state["expected_price_input"] = 0.0
+
+    st.session_state["_active_stock_ticker"] = ticker
 
     add_history(name, ticker)
 
