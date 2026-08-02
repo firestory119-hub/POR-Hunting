@@ -1807,9 +1807,14 @@ if run:
     latest_fin = fin_df.dropna(subset=["revenue"]).tail(1)
     latest_revenue = latest_fin.iloc[0]["revenue"] if not latest_fin.empty else None
 
-    current_price = get_current_price(ticker)
-    if not current_price and "price" in latest.index and pd.notna(latest["price"]):
-        current_price = float(latest["price"])
+    # 차트의 마지막 가격을 현재가로 우선 사용
+    current_price = None
+    if "price" in latest.index and pd.notna(latest["price"]):
+       current_price = float(latest["price"])
+
+    # 차트 가격이 없을 때만 market_data.csv 가격 사용
+    if not current_price:
+       current_price = get_current_price(ticker)
 
     # 실제 최근 연도 실적과 최근 흑자 기준을 분리해 표시합니다.
     actual_fin_sorted = fin_df.sort_values("year").copy()
