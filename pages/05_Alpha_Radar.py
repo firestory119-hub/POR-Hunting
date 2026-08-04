@@ -318,9 +318,46 @@ def build_radar(
         if expected_oi and actual_oi and actual_oi > 0:
             growth = (expected_oi / actual_oi - 1) * 100
 
+        discount_rate = None
+        if (
+            current_por is not None
+            and avg_por is not None
+            and avg_por > 0
+        ):
+            discount_rate = (
+                (avg_por - current_por) / avg_por * 100
+            )
+
         score = alpha_score(
             current_por, avg_por, expected_por, upside, growth
         )
+
+        reasons = []
+
+        if discount_rate is not None:
+            if discount_rate >= 50:
+                reasons.append(
+                    f"평균 POR 대비 {discount_rate:.1f}% 할인"
+                )
+            elif discount_rate > 0:
+                reasons.append(
+                    f"평균 POR 대비 {discount_rate:.1f}% 저평가"
+                )
+
+        if expected_por is not None:
+            reasons.append(
+                f"{selected_year}E POR {expected_por:.2f}배"
+            )
+
+        if growth is not None and growth > 0:
+            reasons.append(
+                f"영업이익 성장률 +{growth:.1f}%"
+            )
+
+        if upside is not None:
+            reasons.append(
+                f"목표가 상승여력 {upside:+.1f}%"
+            )
 
         rows.append({
             "종목명": name,
@@ -332,6 +369,7 @@ def build_radar(
             "최근 흑자 영업이익(억)": actual_oi,
             "최근 흑자 기준 POR": current_por,
             f"{average_years}년 평균 POR": avg_por,
+            "평균 대비 할인율(%)": discount_rate,
             f"{selected_year}E 영업이익(억)": expected_oi,
             f"{selected_year}E POR": expected_por,
             "목표 POR": target_por,
@@ -342,6 +380,7 @@ def build_radar(
             "Alpha": stars(score),
             "Signal": signal(score),
             "컨센서스 수정일": updated_at,
+            "추천 이유": " · ".join(reasons[:4]),
         })
 
     if not rows:
@@ -356,10 +395,10 @@ def build_radar(
     return df
 
 
-st.title("⭐ Alpha Radar")
+st.title("⭐ Alpha Radar V50.2")
 st.caption(
-    "즐겨찾기 전체를 현재 POR, 장기 평균 POR, "
-    "연도별 예상 영업이익과 목표 POR로 자동 순위화합니다."
+    "즐겨찾기 전체를 현재 POR, 장기 평균 POR, 할인율, "
+    "예상 영업이익과 목표 POR로 자동 순위화합니다."
 )
 
 favorites = load_favorites()
@@ -407,6 +446,51 @@ with c4:
         5,
     )
 
+st.markdown("### 빠른 필터")
+f1, f2, f3, f4, f5 = st.columns(5)
+
+with f1:
+    minimum_stars = st.selectbox(
+        "최소 별점",
+        ["전체", "★★★☆☆ 이상", "★★★★☆ 이상", "★★★★★만"],
+        index=0,
+    )
+
+with f2:
+    max_expected_por = st.number_input(
+        f"최대 {selected_year}E POR",
+        min_value=0.0,
+        max_value=100.0,
+        value=0.0,
+        step=0.5,
+        help="0이면 제한 없음",
+    )
+
+with f3:
+    min_discount = st.number_input(
+        "최소 할인율(%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=0.0,
+        step=5.0,
+        help="0이면 제한 없음",
+    )
+
+with f4:
+    min_upside = st.number_input(
+        "최소 상승여력(%)",
+        min_value=-100.0,
+        max_value=1000.0,
+        value=-100.0,
+        step=10.0,
+    )
+
+with f5:
+    consensus_only = st.checkbox(
+        "컨센서스 있는 종목만",
+        value=False,
+    )
+
 with st.spinner(f"즐겨찾기 {len(favorites)}개 분석 중..."):
     radar = build_radar(
         favorites,
@@ -423,7 +507,53 @@ if radar.empty:
     st.warning("계산 가능한 종목이 없습니다.")
     st.stop()
 
-filtered = radar[radar["Alpha Score"] >= minimum_score].copy()
+filtered = radar[
+    radar["Alpha Score"] >= minimum_score
+].copy()
+
+star_threshold_map = {
+    "전체": 0,
+    "★★★☆☆ 이상": 3,
+    "★★★★☆ 이상": 4,
+    "★★★★★만": 5,
+}
+
+star_threshold = star_threshold_map[minimum_stars]
+
+if star_threshold > 0:
+    filtered = filtered[
+        filtered["Alpha"].str.count("★") >= star_threshold
+    ]
+
+if max_expected_por > 0:
+    filtered = filtered[
+        pd.to_numeric(
+            filtered[f"{selected_year}E POR"],
+            errors="coerce",
+        ) <= max_expected_por
+    ]
+
+if min_discount > 0:
+    filtered = filtered[
+        pd.to_numeric(
+            filtered["평균 대비 할인율(%)"],
+            errors="coerce",
+        ) >= min_discount
+    ]
+
+filtered = filtered[
+    pd.to_numeric(
+        filtered["상승여력(%)"],
+        errors="coerce",
+    ).fillna(-9999) >= min_upside
+]
+
+if consensus_only:
+    filtered = filtered[
+        filtered[
+            f"{selected_year}E 영업이익(억)"
+        ].notna()
+    ]
 
 sort_col = st.radio(
     "정렬 기준",
@@ -431,6 +561,7 @@ sort_col = st.radio(
         "Alpha Score",
         f"{selected_year}E POR",
         "최근 흑자 기준 POR",
+        "평균 대비 할인율(%)",
         "상승여력(%)",
         "영업이익 성장률(%)",
     ],
@@ -445,6 +576,11 @@ filtered = filtered.sort_values(
     ascending=ascending,
     na_position="last",
 ).reset_index(drop=True)
+
+if filtered.empty:
+    st.warning("현재 필터 조건에 맞는 종목이 없습니다.")
+    st.stop()
+
 filtered["순위"] = range(1, len(filtered) + 1)
 
 m1, m2, m3, m4 = st.columns(4)
@@ -482,6 +618,45 @@ fig.update_layout(
 )
 st.plotly_chart(fig, use_container_width=True)
 
+st.markdown("### 오늘의 추천")
+recommendations = filtered.head(5)
+
+card_columns = st.columns(
+    min(5, len(recommendations))
+)
+
+for index, (_, row) in enumerate(
+    recommendations.iterrows()
+):
+    with card_columns[index]:
+        st.markdown(
+            f"#### {row['종목명']}"
+        )
+        st.metric(
+            "Alpha Score",
+            f"{row['Alpha Score']:.1f}점",
+        )
+        st.write(row["Alpha"])
+        st.caption(row["Signal"])
+
+        discount_value = row.get(
+            "평균 대비 할인율(%)"
+        )
+        upside_value = row.get("상승여력(%)")
+
+        if pd.notna(discount_value):
+            st.write(
+                f"평균 대비 할인 **{discount_value:.1f}%**"
+            )
+
+        if pd.notna(upside_value):
+            st.write(
+                f"상승여력 **{upside_value:+.1f}%**"
+            )
+
+        if row.get("추천 이유"):
+            st.caption(row["추천 이유"])
+
 st.markdown("### 전체 순위")
 columns = [
     "순위",
@@ -494,12 +669,14 @@ columns = [
     "최근 흑자연도",
     "최근 흑자 기준 POR",
     f"{average_years}년 평균 POR",
+    "평균 대비 할인율(%)",
     f"{selected_year}E 영업이익(억)",
     f"{selected_year}E POR",
     "목표 POR",
     "목표 주가",
     "상승여력(%)",
     "영업이익 성장률(%)",
+    "추천 이유",
     "컨센서스 수정일",
 ]
 
@@ -521,6 +698,9 @@ st.dataframe(
         ),
         f"{selected_year}E 영업이익(억)": st.column_config.NumberColumn(
             format="%,.1f억"
+        ),
+        "평균 대비 할인율(%)": st.column_config.NumberColumn(
+            format="%.1f%%"
         ),
         f"{selected_year}E POR": st.column_config.NumberColumn(
             format="%.2f배"
