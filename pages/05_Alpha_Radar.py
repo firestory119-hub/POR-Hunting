@@ -512,7 +512,7 @@ def build_radar(
     return df
 
 
-st.title("⭐ Alpha Radar V51 POR History")
+st.title("⭐ Alpha Radar V51.1 Row Click")
 st.caption(
     "즐겨찾기 전체를 현재 POR, 장기 평균 POR, 할인율, "
     "상승여력과 투자 의견으로 자동 순위화합니다."
@@ -851,6 +851,9 @@ st.caption(
     "투자 의견 기준: 85점 이상 Strong Buy · 70점 이상 Buy · "
     "55점 이상 Watch · 40점 이상 Neutral · 그 미만 Caution"
 )
+st.info(
+    "전체 순위 표에서 종목 행을 한 번 클릭하면 차트로 바로 이동합니다."
+)
 
 columns = [
     "순위",
@@ -877,10 +880,13 @@ columns = [
     "컨센서스 수정일",
 ]
 
-st.dataframe(
+table_event = st.dataframe(
     filtered[columns],
     use_container_width=True,
     hide_index=True,
+    on_select="rerun",
+    selection_mode="single-row",
+    key="alpha_radar_rank_table",
     column_config={
         "Alpha Score": st.column_config.ProgressColumn(
             min_value=0,
@@ -920,6 +926,25 @@ st.dataframe(
         "영업이익 성장률(%)": st.column_config.NumberColumn(format="%.1f%%"),
     },
 )
+
+selected_rows = table_event.selection.rows
+
+if selected_rows:
+    selected_index = int(selected_rows[0])
+    selected_stock = str(
+        filtered.iloc[selected_index]["종목명"]
+    )
+
+    st.session_state["stock_query"] = selected_stock
+    st.query_params["collecting_name"] = selected_stock
+
+    try:
+        st.switch_page("app.py")
+    except Exception:
+        st.info(
+            f"종목분석 화면에서 '{selected_stock}'을 검색하세요."
+        )
+
 
 st.markdown("### POR History 상세")
 
