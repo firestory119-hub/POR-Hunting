@@ -220,6 +220,90 @@ def average_por(history, financials, ticker, years):
     return float(pd.Series(values).mean()) if values else None
 
 
+def por_history_stats(history, financials, ticker, years):
+    """
+    선택 기간의 POR 최저·최고·평균과 현재 POR의 백분위 위치를 계산합니다.
+    최근 흑자 영업이익을 해당 연도까지 순차 적용하는 기존 방식과 동일합니다.
+    """
+    stock = history[
+        history["ticker"] == ticker
+    ].sort_values("date")
+
+    actual = financials[
+        (financials["ticker"] == ticker)
+        & financials["operating_income"].notna()
+        & (financials["operating_income"] > 0)
+    ][["year", "operating_income"]].copy()
+
+    if stock.empty or actual.empty:
+        return {
+            "min": None,
+            "max": None,
+            "mean": None,
+            "percentile": None,
+            "count": 0,
+        }
+
+    cutoff = stock["date"].max() - pd.DateOffset(
+        years=years
+    )
+    stock = stock[stock["date"] >= cutoff].copy()
+
+    actual_map = {
+        int(row["year"]): float(row["operating_income"])
+        for _, row in actual.iterrows()
+    }
+
+    values = []
+
+    for _, row in stock.iterrows():
+        year = int(row["date"].year)
+        candidates = [
+            actual_year
+            for actual_year in actual_map
+            if actual_year <= year
+        ]
+
+        if not candidates:
+            continue
+
+        base = actual_map[max(candidates)]
+
+        if base > 0 and row["market_cap"] > 0:
+            values.append(row["market_cap"] / base)
+
+    if not values:
+        return {
+            "min": None,
+            "max": None,
+            "mean": None,
+            "percentile": None,
+            "count": 0,
+        }
+
+    series = pd.Series(values, dtype=float)
+    current_value = float(series.iloc[-1])
+    minimum = float(series.min())
+    maximum = float(series.max())
+
+    if maximum > minimum:
+        percentile = (
+            (current_value - minimum)
+            / (maximum - minimum)
+            * 100
+        )
+    else:
+        percentile = 50.0
+
+    return {
+        "min": minimum,
+        "max": maximum,
+        "mean": float(series.mean()),
+        "percentile": float(percentile),
+        "count": int(len(series)),
+    }
+
+
 def alpha_score(current_por, avg_por, expected_por, upside, growth):
     score = 0.0
     if current_por and avg_por and avg_por > 0:
@@ -309,6 +393,13 @@ def build_radar(
             history, financials, ticker, average_years
         )
 
+        history_stats = por_history_stats(
+            history,
+            financials,
+            ticker,
+            average_years,
+        )
+
         c = consensus[
             (consensus["ticker"] == ticker)
             & (consensus["year"] == selected_year)
@@ -391,6 +482,10 @@ def build_radar(
             "최근 흑자 영업이익(억)": actual_oi,
             "최근 흑자 기준 POR": current_por,
             f"{average_years}년 평균 POR": avg_por,
+            f"{average_years}년 최저 POR": history_stats["min"],
+            f"{average_years}년 최고 POR": history_stats["max"],
+            "현재 POR 위치(%)": history_stats["percentile"],
+            "POR 표본 수": history_stats["count"],
             "평균 대비 할인율(%)": discount_rate,
             f"{selected_year}E 영업이익(억)": expected_oi,
             f"{selected_year}E POR": expected_por,
@@ -417,7 +512,7 @@ def build_radar(
     return df
 
 
-st.title("⭐ Alpha Radar V50.3")
+st.title("⭐ Alpha Radar V51 POR History")
 st.caption(
     "즐겨찾기 전체를 현재 POR, 장기 평균 POR, 할인율, "
     "상승여력과 투자 의견으로 자동 순위화합니다."
@@ -584,6 +679,7 @@ sort_col = st.radio(
         f"{selected_year}E POR",
         "최근 흑자 기준 POR",
         "평균 대비 할인율(%)",
+        "현재 POR 위치(%)",
         "상승여력(%)",
         "영업이익 성장률(%)",
     ],
@@ -592,6 +688,7 @@ sort_col = st.radio(
 ascending = sort_col in [
     f"{selected_year}E POR",
     "최근 흑자 기준 POR",
+    "현재 POR 위치(%)",
 ]
 filtered = filtered.sort_values(
     sort_col,
@@ -766,6 +863,9 @@ columns = [
     "최근 흑자연도",
     "최근 흑자 기준 POR",
     f"{average_years}년 평균 POR",
+    f"{average_years}년 최저 POR",
+    f"{average_years}년 최고 POR",
+    "현재 POR 위치(%)",
     "평균 대비 할인율(%)",
     f"{selected_year}E 영업이익(억)",
     f"{selected_year}E POR",
@@ -796,6 +896,18 @@ st.dataframe(
         f"{selected_year}E 영업이익(억)": st.column_config.NumberColumn(
             format="%,.1f억"
         ),
+        f"{average_years}년 최저 POR": st.column_config.NumberColumn(
+            format="%.2f배"
+        ),
+        f"{average_years}년 최고 POR": st.column_config.NumberColumn(
+            format="%.2f배"
+        ),
+        "현재 POR 위치(%)": st.column_config.ProgressColumn(
+            min_value=0,
+            max_value=100,
+            format="%.1f%%",
+            help="선택 기간 최저 POR=0%, 최고 POR=100%",
+        ),
         "평균 대비 할인율(%)": st.column_config.NumberColumn(
             format="%.1f%%"
         ),
@@ -809,13 +921,111 @@ st.dataframe(
     },
 )
 
+st.markdown("### POR History 상세")
+
+history_stock = st.selectbox(
+    "POR 위치를 확인할 종목",
+    filtered["종목명"].tolist(),
+    key="por_history_stock",
+)
+
+history_row = filtered[
+    filtered["종목명"] == history_stock
+].iloc[0]
+
+h1, h2, h3, h4, h5 = st.columns(5)
+
+h1.metric(
+    "현재 POR",
+    (
+        f"{history_row['최근 흑자 기준 POR']:.2f}배"
+        if pd.notna(history_row["최근 흑자 기준 POR"])
+        else "-"
+    ),
+)
+h2.metric(
+    f"{average_years}년 평균",
+    (
+        f"{history_row[f'{average_years}년 평균 POR']:.2f}배"
+        if pd.notna(
+            history_row[f"{average_years}년 평균 POR"]
+        )
+        else "-"
+    ),
+)
+h3.metric(
+    f"{average_years}년 최저",
+    (
+        f"{history_row[f'{average_years}년 최저 POR']:.2f}배"
+        if pd.notna(
+            history_row[f"{average_years}년 최저 POR"]
+        )
+        else "-"
+    ),
+)
+h4.metric(
+    f"{average_years}년 최고",
+    (
+        f"{history_row[f'{average_years}년 최고 POR']:.2f}배"
+        if pd.notna(
+            history_row[f"{average_years}년 최고 POR"]
+        )
+        else "-"
+    ),
+)
+h5.metric(
+    "현재 위치",
+    (
+        f"{history_row['현재 POR 위치(%)']:.1f}%"
+        if pd.notna(history_row["현재 POR 위치(%)"])
+        else "-"
+    ),
+)
+
+position_value = history_row.get("현재 POR 위치(%)")
+
+if pd.notna(position_value):
+    st.progress(
+        max(0, min(100, int(position_value))),
+        text=(
+            f"{history_stock}의 현재 POR는 "
+            f"{average_years}년 범위에서 "
+            f"아래로부터 약 {position_value:.1f}% 위치입니다."
+        ),
+    )
+
+    if position_value <= 20:
+        st.success(
+            "역사적 저평가 구간에 가깝습니다."
+        )
+    elif position_value <= 40:
+        st.info(
+            "역사적 평균보다 낮은 구간입니다."
+        )
+    elif position_value >= 80:
+        st.warning(
+            "역사적 고평가 구간에 가깝습니다."
+        )
+    else:
+        st.caption(
+            "역사적 중간 범위에 위치합니다."
+        )
+
 st.markdown("### 종목분석으로 이동")
 move_col1, move_col2 = st.columns([3, 1])
 
 with move_col1:
+    stock_options = filtered["종목명"].tolist()
+    default_stock_index = (
+        stock_options.index(history_stock)
+        if history_stock in stock_options
+        else 0
+    )
+
     stock_name = st.selectbox(
         "분석할 종목",
-        filtered["종목명"].tolist(),
+        stock_options,
+        index=default_stock_index,
     )
 
 with move_col2:
