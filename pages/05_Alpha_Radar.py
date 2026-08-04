@@ -240,15 +240,37 @@ def stars(score):
 
 
 def signal(score):
-    if score >= 80:
-        return "Strong"
-    if score >= 65:
-        return "Buy"
-    if score >= 50:
-        return "Watch"
-    if score >= 35:
-        return "Neutral"
-    return "Caution"
+    if score >= 85:
+        return "🟢 Strong Buy"
+    if score >= 70:
+        return "🟢 Buy"
+    if score >= 55:
+        return "🟡 Watch"
+    if score >= 40:
+        return "🟠 Neutral"
+    return "🔴 Caution"
+
+
+def score_badge(score):
+    if score >= 85:
+        return "#d8f3dc", "#1b4332"
+    if score >= 70:
+        return "#e9f5db", "#386641"
+    if score >= 55:
+        return "#fff3bf", "#7f4f24"
+    if score >= 40:
+        return "#ffe8cc", "#9c2c13"
+    return "#ffe3e3", "#c92a2a"
+
+
+def signed_badge(value):
+    if value is None or pd.isna(value):
+        return "#f1f3f5", "#495057"
+    if value >= 50:
+        return "#d8f3dc", "#1b4332"
+    if value >= 0:
+        return "#e9f5db", "#386641"
+    return "#ffe3e3", "#c92a2a"
 
 
 def build_radar(
@@ -395,10 +417,10 @@ def build_radar(
     return df
 
 
-st.title("⭐ Alpha Radar V50.2")
+st.title("⭐ Alpha Radar V50.3")
 st.caption(
     "즐겨찾기 전체를 현재 POR, 장기 평균 POR, 할인율, "
-    "예상 영업이익과 목표 POR로 자동 순위화합니다."
+    "상승여력과 투자 의견으로 자동 순위화합니다."
 )
 
 favorites = load_favorites()
@@ -588,7 +610,7 @@ m1.metric("즐겨찾기", f"{len(radar)}개")
 m2.metric("평균 Alpha", f"{radar['Alpha Score'].mean():.1f}점")
 m3.metric(
     "Strong/Buy",
-    f"{radar['Signal'].isin(['Strong', 'Buy']).sum()}개",
+    f"{radar['Signal'].isin(['🟢 Strong Buy', '🟢 Buy']).sum()}개",
 )
 m4.metric(
     "컨센서스 보유",
@@ -608,6 +630,24 @@ fig = go.Figure(
             axis=1,
         ),
         textposition="auto",
+        customdata=top10[
+            [
+                "평균 대비 할인율(%)",
+                "상승여력(%)",
+                f"{selected_year}E POR",
+                "Signal",
+            ]
+        ],
+        hovertemplate=(
+            "<b>%{y}</b><br>"
+            "Alpha Score: %{x:.1f}점<br>"
+            "할인율: %{customdata[0]:.1f}%<br>"
+            "상승여력: %{customdata[1]:.1f}%<br>"
+            f"{selected_year}E POR: "
+            "%{customdata[2]:.2f}배<br>"
+            "%{customdata[3]}"
+            "<extra></extra>"
+        ),
     )
 )
 fig.update_layout(
@@ -618,46 +658,103 @@ fig.update_layout(
 )
 st.plotly_chart(fig, use_container_width=True)
 
-st.markdown("### 오늘의 추천")
+st.markdown("### 오늘의 추천 TOP 5")
 recommendations = filtered.head(5)
+card_columns = st.columns(min(5, len(recommendations)))
 
-card_columns = st.columns(
-    min(5, len(recommendations))
-)
-
-for index, (_, row) in enumerate(
-    recommendations.iterrows()
-):
+for index, (_, row) in enumerate(recommendations.iterrows()):
     with card_columns[index]:
+        score_bg, score_fg = score_badge(row["Alpha Score"])
+        upside_bg, upside_fg = signed_badge(row.get("상승여력(%)"))
+        discount_bg, discount_fg = signed_badge(
+            row.get("평균 대비 할인율(%)")
+        )
+
+        discount_text = (
+            f"{row['평균 대비 할인율(%)']:.1f}%"
+            if pd.notna(row.get("평균 대비 할인율(%)"))
+            else "-"
+        )
+        upside_text = (
+            f"{row['상승여력(%)']:+.1f}%"
+            if pd.notna(row.get("상승여력(%)"))
+            else "-"
+        )
+        expected_por_text = (
+            f"{row[f'{selected_year}E POR']:.2f}배"
+            if pd.notna(row.get(f"{selected_year}E POR"))
+            else "-"
+        )
+
         st.markdown(
-            f"#### {row['종목명']}"
+            f"""
+            <div style="
+                border:1px solid #dee2e6;
+                border-radius:14px;
+                padding:16px;
+                min-height:285px;
+                background:white;
+                box-shadow:0 2px 8px rgba(0,0,0,0.05);
+            ">
+                <div style="font-size:20px;font-weight:800;margin-bottom:6px;">
+                    {row['종목명']}
+                </div>
+                <div style="font-size:18px;margin-bottom:10px;">
+                    {row['Alpha']}
+                </div>
+                <div style="
+                    display:inline-block;
+                    background:{score_bg};
+                    color:{score_fg};
+                    border-radius:999px;
+                    padding:5px 10px;
+                    font-weight:700;
+                    margin-bottom:12px;
+                ">
+                    {row['Signal']} · {row['Alpha Score']:.1f}점
+                </div>
+                <div style="margin:8px 0;">
+                    예상 POR <b>{expected_por_text}</b>
+                </div>
+                <div style="margin:8px 0;">
+                    할인율
+                    <span style="
+                        background:{discount_bg};
+                        color:{discount_fg};
+                        border-radius:8px;
+                        padding:3px 7px;
+                        font-weight:700;
+                    ">{discount_text}</span>
+                </div>
+                <div style="margin:8px 0;">
+                    상승여력
+                    <span style="
+                        background:{upside_bg};
+                        color:{upside_fg};
+                        border-radius:8px;
+                        padding:3px 7px;
+                        font-weight:700;
+                    ">{upside_text}</span>
+                </div>
+                <div style="
+                    color:#6c757d;
+                    font-size:12px;
+                    line-height:1.45;
+                    margin-top:12px;
+                ">
+                    {row.get('추천 이유', '')}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-        st.metric(
-            "Alpha Score",
-            f"{row['Alpha Score']:.1f}점",
-        )
-        st.write(row["Alpha"])
-        st.caption(row["Signal"])
-
-        discount_value = row.get(
-            "평균 대비 할인율(%)"
-        )
-        upside_value = row.get("상승여력(%)")
-
-        if pd.notna(discount_value):
-            st.write(
-                f"평균 대비 할인 **{discount_value:.1f}%**"
-            )
-
-        if pd.notna(upside_value):
-            st.write(
-                f"상승여력 **{upside_value:+.1f}%**"
-            )
-
-        if row.get("추천 이유"):
-            st.caption(row["추천 이유"])
 
 st.markdown("### 전체 순위")
+st.caption(
+    "투자 의견 기준: 85점 이상 Strong Buy · 70점 이상 Buy · "
+    "55점 이상 Watch · 40점 이상 Neutral · 그 미만 Caution"
+)
+
 columns = [
     "순위",
     "종목명",
@@ -713,12 +810,24 @@ st.dataframe(
 )
 
 st.markdown("### 종목분석으로 이동")
-stock_name = st.selectbox(
-    "분석할 종목",
-    filtered["종목명"].tolist(),
-)
+move_col1, move_col2 = st.columns([3, 1])
 
-if st.button("📈 선택 종목 차트 열기", type="primary"):
+with move_col1:
+    stock_name = st.selectbox(
+        "분석할 종목",
+        filtered["종목명"].tolist(),
+    )
+
+with move_col2:
+    st.write("")
+    st.write("")
+    open_stock = st.button(
+        "📈 차트 열기",
+        type="primary",
+        use_container_width=True,
+    )
+
+if open_stock:
     st.session_state["stock_query"] = stock_name
     st.query_params["collecting_name"] = stock_name
     try:
