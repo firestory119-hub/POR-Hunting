@@ -1,0 +1,564 @@
+import os
+import re
+from datetime import datetime
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+st.set_page_config(page_title="Alpha Radar", page_icon="⭐", layout="wide")
+
+DATA_DIR = "data"
+FAVORITES_FILE = os.path.join(DATA_DIR, "favorites.csv")
+MARKET_DATA_CSV = os.path.join(DATA_DIR, "market_data.csv")
+MARKET_HISTORY_CSV = os.path.join(DATA_DIR, "market_history.csv")
+FINANCIAL_DATA_CSV = os.path.join(DATA_DIR, "financial_data.csv")
+CONSENSUS_XLSX = os.path.join(DATA_DIR, "consensus.xlsx")
+
+
+def clean_ticker(value):
+    text = str(value or "").strip().replace(".0", "")
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return digits.zfill(6) if digits else ""
+
+
+def load_favorites():
+    key = "_session_favorites.csv"
+    if key in st.session_state:
+        df = st.session_state[key].copy()
+    elif os.path.exists(FAVORITES_FILE):
+        df = pd.read_csv(FAVORITES_FILE, dtype=str)
+    else:
+        return pd.DataFrame(columns=["name", "ticker", "saved_at"])
+
+    for col in ["name", "ticker", "saved_at"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    df["ticker"] = df["ticker"].map(clean_ticker)
+    return df[["name", "ticker", "saved_at"]].drop_duplicates(
+        "ticker", keep="last"
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def load_market():
+    if not os.path.exists(MARKET_DATA_CSV):
+        return pd.DataFrame()
+
+    df = pd.read_csv(MARKET_DATA_CSV, dtype=str)
+    rename = {}
+    if "name" in df.columns and "종목명" not in df.columns:
+        rename["name"] = "종목명"
+    if "ticker" in df.columns and "종목코드" not in df.columns:
+        rename["ticker"] = "종목코드"
+    if "price" in df.columns and "현재가" not in df.columns:
+        rename["price"] = "현재가"
+    if "market_cap_eok" in df.columns and "현재시총_억원" not in df.columns:
+        rename["market_cap_eok"] = "현재시총_억원"
+    df = df.rename(columns=rename)
+
+    if not {"종목명", "종목코드"}.issubset(df.columns):
+        return pd.DataFrame()
+
+    df["종목코드"] = df["종목코드"].map(clean_ticker)
+    for col in ["현재가", "현재시총_억원"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df.drop_duplicates("종목코드")
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def load_financials():
+    if not os.path.exists(FINANCIAL_DATA_CSV):
+        return pd.DataFrame()
+
+    df = pd.read_csv(FINANCIAL_DATA_CSV, dtype={"ticker": str})
+    if "종목코드" in df.columns and "ticker" not in df.columns:
+        df = df.rename(columns={"종목코드": "ticker"})
+    if "ticker" not in df.columns or "year" not in df.columns:
+        return pd.DataFrame()
+
+    df["ticker"] = df["ticker"].map(clean_ticker)
+    df["year"] = pd.to_numeric(df["year"], errors="coerce")
+    df["operating_income"] = pd.to_numeric(
+        df.get("operating_income"), errors="coerce"
+    )
+    return df
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def load_consensus():
+    columns = [
+        "name", "ticker", "year", "operating_income_eok",
+        "target_por", "updated_at"
+    ]
+    if not os.path.exists(CONSENSUS_XLSX):
+        return pd.DataFrame(columns=columns)
+
+    try:
+        wide = pd.read_excel(
+            CONSENSUS_XLSX,
+            sheet_name="컨센서스입력",
+            header=1,
+            dtype={"종목코드": str},
+            engine="openpyxl",
+        )
+    except Exception:
+        return pd.DataFrame(columns=columns)
+
+    if not {"종목명", "종목코드"}.issubset(wide.columns):
+        return pd.DataFrame(columns=columns)
+
+    year_cols = [
+        c for c in wide.columns
+        if re.fullmatch(r"\d{4}E?", str(c).strip())
+    ]
+    id_cols = [
+        c for c in ["종목명", "종목코드", "목표POR", "업데이트일"]
+        if c in wide.columns
+    ]
+
+    long_df = wide.melt(
+        id_vars=id_cols,
+        value_vars=year_cols,
+        var_name="year",
+        value_name="operating_income_eok",
+    ).rename(columns={
+        "종목명": "name",
+        "종목코드": "ticker",
+        "목표POR": "target_por",
+        "업데이트일": "updated_at",
+    })
+
+    long_df["ticker"] = long_df["ticker"].map(clean_ticker)
+    long_df["year"] = pd.to_numeric(
+        long_df["year"].astype(str).str.extract(r"(\d{4})")[0],
+        errors="coerce",
+    )
+    long_df["operating_income_eok"] = pd.to_numeric(
+        long_df["operating_income_eok"], errors="coerce"
+    )
+    if "target_por" not in long_df.columns:
+        long_df["target_por"] = None
+    if "updated_at" not in long_df.columns:
+        long_df["updated_at"] = None
+    long_df["target_por"] = pd.to_numeric(
+        long_df["target_por"], errors="coerce"
+    )
+
+    return long_df.dropna(
+        subset=["ticker", "year", "operating_income_eok"]
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def load_history(tickers):
+    cols = ["ticker", "date", "price", "market_cap"]
+    if not os.path.exists(MARKET_HISTORY_CSV):
+        return pd.DataFrame(columns=cols)
+
+    try:
+        df = pd.read_csv(
+            MARKET_HISTORY_CSV,
+            usecols=cols,
+            dtype={"ticker": str},
+        )
+    except Exception:
+        return pd.DataFrame(columns=cols)
+
+    df["ticker"] = df["ticker"].map(clean_ticker)
+    df = df[df["ticker"].isin(tickers)].copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df["market_cap"] = pd.to_numeric(df["market_cap"], errors="coerce")
+    return df.dropna(subset=["ticker", "date", "market_cap"])
+
+
+def latest_positive(financials, ticker):
+    rows = financials[
+        (financials["ticker"] == ticker)
+        & financials["operating_income"].notna()
+        & (financials["operating_income"] > 0)
+    ].sort_values("year")
+
+    if rows.empty:
+        return None, None
+
+    row = rows.iloc[-1]
+    return int(row["year"]), float(row["operating_income"]) / 100_000_000
+
+
+def average_por(history, financials, ticker, years):
+    stock = history[history["ticker"] == ticker].sort_values("date")
+    actual = financials[
+        (financials["ticker"] == ticker)
+        & financials["operating_income"].notna()
+        & (financials["operating_income"] > 0)
+    ][["year", "operating_income"]]
+
+    if stock.empty or actual.empty:
+        return None
+
+    cutoff = stock["date"].max() - pd.DateOffset(years=years)
+    stock = stock[stock["date"] >= cutoff]
+    actual_map = {
+        int(r["year"]): float(r["operating_income"])
+        for _, r in actual.iterrows()
+    }
+
+    values = []
+    for _, r in stock.iterrows():
+        candidates = [y for y in actual_map if y <= int(r["date"].year)]
+        if not candidates:
+            continue
+        base = actual_map[max(candidates)]
+        if base > 0 and r["market_cap"] > 0:
+            values.append(r["market_cap"] / base)
+
+    return float(pd.Series(values).mean()) if values else None
+
+
+def alpha_score(current_por, avg_por, expected_por, upside, growth):
+    score = 0.0
+    if current_por and avg_por and avg_por > 0:
+        discount = (avg_por - current_por) / avg_por
+        score += max(0, min(35, 17.5 + discount * 70))
+    if expected_por:
+        score += max(0, min(25, (15 - expected_por) * 2.5))
+    if upside is not None:
+        score += max(0, min(25, upside / 4))
+    if growth is not None:
+        score += max(0, min(15, growth / 6))
+    return round(max(0, min(100, score)), 1)
+
+
+def stars(score):
+    n = max(1, min(5, int((score + 19.999) // 20)))
+    return "★" * n + "☆" * (5 - n)
+
+
+def signal(score):
+    if score >= 80:
+        return "Strong"
+    if score >= 65:
+        return "Buy"
+    if score >= 50:
+        return "Watch"
+    if score >= 35:
+        return "Neutral"
+    return "Caution"
+
+
+def build_radar(
+    favorites, market, financials, consensus, history,
+    selected_year, average_years, default_target_por
+):
+    rows = []
+
+    for _, fav in favorites.iterrows():
+        ticker = clean_ticker(fav["ticker"])
+        m = market[market["종목코드"] == ticker]
+        if m.empty:
+            continue
+
+        m = m.iloc[0]
+        name = str(m.get("종목명", fav.get("name", ticker)))
+        h = history[history["ticker"] == ticker].sort_values("date")
+
+        if not h.empty:
+            last = h.iloc[-1]
+            price = float(last["price"])
+            mcap = float(last["market_cap"]) / 100_000_000
+            base_date = last["date"]
+        else:
+            price = pd.to_numeric(m.get("현재가"), errors="coerce")
+            mcap = pd.to_numeric(m.get("현재시총_억원"), errors="coerce")
+            base_date = pd.NaT
+
+        profit_year, actual_oi = latest_positive(financials, ticker)
+        current_por = (
+            mcap / actual_oi
+            if pd.notna(mcap) and mcap > 0 and actual_oi and actual_oi > 0
+            else None
+        )
+        avg_por = average_por(
+            history, financials, ticker, average_years
+        )
+
+        c = consensus[
+            (consensus["ticker"] == ticker)
+            & (consensus["year"] == selected_year)
+        ]
+        expected_oi = None
+        target_por = float(default_target_por)
+        updated_at = None
+
+        if not c.empty:
+            c = c.iloc[-1]
+            expected_oi = float(c["operating_income_eok"])
+            saved_target = pd.to_numeric(c.get("target_por"), errors="coerce")
+            if pd.notna(saved_target) and saved_target > 0:
+                target_por = float(saved_target)
+            updated_at = c.get("updated_at")
+
+        expected_por = None
+        target_price = None
+        upside = None
+        growth = None
+
+        if expected_oi and expected_oi > 0 and pd.notna(mcap) and mcap > 0:
+            expected_por = mcap / expected_oi
+            target_mcap = expected_oi * target_por
+            if pd.notna(price) and price > 0:
+                target_price = price * target_mcap / mcap
+                upside = (target_price / price - 1) * 100
+
+        if expected_oi and actual_oi and actual_oi > 0:
+            growth = (expected_oi / actual_oi - 1) * 100
+
+        score = alpha_score(
+            current_por, avg_por, expected_por, upside, growth
+        )
+
+        rows.append({
+            "종목명": name,
+            "종목코드": ticker,
+            "기준일": base_date,
+            "현재가": price,
+            "현재시총(억)": mcap,
+            "최근 흑자연도": profit_year,
+            "최근 흑자 영업이익(억)": actual_oi,
+            "최근 흑자 기준 POR": current_por,
+            f"{average_years}년 평균 POR": avg_por,
+            f"{selected_year}E 영업이익(억)": expected_oi,
+            f"{selected_year}E POR": expected_por,
+            "목표 POR": target_por,
+            "목표 주가": target_price,
+            "상승여력(%)": upside,
+            "영업이익 성장률(%)": growth,
+            "Alpha Score": score,
+            "Alpha": stars(score),
+            "Signal": signal(score),
+            "컨센서스 수정일": updated_at,
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows).sort_values(
+        ["Alpha Score", "상승여력(%)"],
+        ascending=[False, False],
+        na_position="last",
+    ).reset_index(drop=True)
+    df.insert(0, "순위", range(1, len(df) + 1))
+    return df
+
+
+st.title("⭐ Alpha Radar")
+st.caption(
+    "즐겨찾기 전체를 현재 POR, 장기 평균 POR, "
+    "연도별 예상 영업이익과 목표 POR로 자동 순위화합니다."
+)
+
+favorites = load_favorites()
+market = load_market()
+financials = load_financials()
+consensus = load_consensus()
+
+if favorites.empty:
+    st.warning("즐겨찾기가 없습니다.")
+    st.stop()
+
+if market.empty or financials.empty:
+    st.error("market_data.csv 또는 financial_data.csv를 읽지 못했습니다.")
+    st.stop()
+
+history = load_history(tuple(favorites["ticker"].tolist()))
+available_years = sorted(
+    consensus["year"].dropna().astype(int).unique().tolist()
+) or [datetime.today().year]
+
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    selected_year = st.selectbox("컨센서스 연도", available_years)
+with c2:
+    average_years = st.selectbox(
+        "평균 POR 기간",
+        [3, 5, 10],
+        index=2,
+        format_func=lambda x: f"{x}년",
+    )
+with c3:
+    default_target_por = st.number_input(
+        "기본 목표 POR",
+        min_value=1.0,
+        max_value=50.0,
+        value=8.0,
+        step=0.5,
+    )
+with c4:
+    minimum_score = st.slider(
+        "최소 Alpha Score",
+        0,
+        100,
+        0,
+        5,
+    )
+
+with st.spinner(f"즐겨찾기 {len(favorites)}개 분석 중..."):
+    radar = build_radar(
+        favorites,
+        market,
+        financials,
+        consensus,
+        history,
+        int(selected_year),
+        int(average_years),
+        float(default_target_por),
+    )
+
+if radar.empty:
+    st.warning("계산 가능한 종목이 없습니다.")
+    st.stop()
+
+filtered = radar[radar["Alpha Score"] >= minimum_score].copy()
+
+sort_col = st.radio(
+    "정렬 기준",
+    [
+        "Alpha Score",
+        f"{selected_year}E POR",
+        "최근 흑자 기준 POR",
+        "상승여력(%)",
+        "영업이익 성장률(%)",
+    ],
+    horizontal=True,
+)
+ascending = sort_col in [
+    f"{selected_year}E POR",
+    "최근 흑자 기준 POR",
+]
+filtered = filtered.sort_values(
+    sort_col,
+    ascending=ascending,
+    na_position="last",
+).reset_index(drop=True)
+filtered["순위"] = range(1, len(filtered) + 1)
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("즐겨찾기", f"{len(radar)}개")
+m2.metric("평균 Alpha", f"{radar['Alpha Score'].mean():.1f}점")
+m3.metric(
+    "Strong/Buy",
+    f"{radar['Signal'].isin(['Strong', 'Buy']).sum()}개",
+)
+m4.metric(
+    "컨센서스 보유",
+    f"{radar[f'{selected_year}E 영업이익(억)'].notna().sum()}개",
+)
+
+st.markdown("### Alpha TOP 10")
+top10 = filtered.head(10)
+
+fig = go.Figure(
+    go.Bar(
+        x=top10["Alpha Score"],
+        y=top10["종목명"],
+        orientation="h",
+        text=top10.apply(
+            lambda r: f"{r['Alpha Score']:.1f}점 {r['Alpha']}",
+            axis=1,
+        ),
+        textposition="auto",
+    )
+)
+fig.update_layout(
+    height=max(420, len(top10) * 48),
+    xaxis_title="Alpha Score",
+    yaxis=dict(autorange="reversed"),
+    margin=dict(l=30, r=30, t=30, b=40),
+)
+st.plotly_chart(fig, use_container_width=True)
+
+st.markdown("### 전체 순위")
+columns = [
+    "순위",
+    "종목명",
+    "Alpha",
+    "Signal",
+    "Alpha Score",
+    "현재가",
+    "현재시총(억)",
+    "최근 흑자연도",
+    "최근 흑자 기준 POR",
+    f"{average_years}년 평균 POR",
+    f"{selected_year}E 영업이익(억)",
+    f"{selected_year}E POR",
+    "목표 POR",
+    "목표 주가",
+    "상승여력(%)",
+    "영업이익 성장률(%)",
+    "컨센서스 수정일",
+]
+
+st.dataframe(
+    filtered[columns],
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "Alpha Score": st.column_config.ProgressColumn(
+            min_value=0,
+            max_value=100,
+            format="%.1f",
+        ),
+        "현재가": st.column_config.NumberColumn(format="%,.0f원"),
+        "현재시총(억)": st.column_config.NumberColumn(format="%,.0f억"),
+        "최근 흑자 기준 POR": st.column_config.NumberColumn(format="%.2f배"),
+        f"{average_years}년 평균 POR": st.column_config.NumberColumn(
+            format="%.2f배"
+        ),
+        f"{selected_year}E 영업이익(억)": st.column_config.NumberColumn(
+            format="%,.1f억"
+        ),
+        f"{selected_year}E POR": st.column_config.NumberColumn(
+            format="%.2f배"
+        ),
+        "목표 POR": st.column_config.NumberColumn(format="%.1f배"),
+        "목표 주가": st.column_config.NumberColumn(format="%,.0f원"),
+        "상승여력(%)": st.column_config.NumberColumn(format="%.1f%%"),
+        "영업이익 성장률(%)": st.column_config.NumberColumn(format="%.1f%%"),
+    },
+)
+
+st.markdown("### 종목분석으로 이동")
+stock_name = st.selectbox(
+    "분석할 종목",
+    filtered["종목명"].tolist(),
+)
+
+if st.button("📈 선택 종목 차트 열기", type="primary"):
+    st.session_state["stock_query"] = stock_name
+    st.query_params["collecting_name"] = stock_name
+    try:
+        st.switch_page("app.py")
+    except Exception:
+        st.success(f"종목분석에서 '{stock_name}'을 검색하세요.")
+
+st.download_button(
+    "📥 Alpha Radar CSV 다운로드",
+    data=filtered.to_csv(index=False, encoding="utf-8-sig"),
+    file_name=f"alpha_radar_{selected_year}E.csv",
+    mime="text/csv",
+)
+
+with st.expander("Alpha Score 계산 방식"):
+    st.markdown(
+        """
+- 장기 평균 POR 대비 할인 정도: 최대 35점
+- 예상 POR의 낮은 정도: 최대 25점
+- 목표 POR 기준 상승여력: 최대 25점
+- 최근 흑자 대비 예상 영업이익 성장률: 최대 15점
+        """
+    )
