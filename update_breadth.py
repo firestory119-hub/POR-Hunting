@@ -6,53 +6,131 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import FinanceDataReader as fdr
 import pandas as pd
-from pykrx import stock
 
 
 DATA_DIR = Path("data")
 BREADTH_HISTORY = DATA_DIR / "breadth_history.csv"
 BREADTH_CLOSE_HISTORY = DATA_DIR / "breadth_close_history.csv"
 
-MARKETS = {
-    "KOSPI": "1001",
-    "KOSDAQ": "2001",
+INDEX_SYMBOLS = {
+    "KOSPI": "KS11",
+    "KOSDAQ": "KQ11",
 }
 
 LOOKBACK_CALENDAR_DAYS = 430
-MAX_WORKERS = int(os.getenv("BREADTH_WORKERS", "12"))
-REQUEST_DELAY = float(os.getenv("BREADTH_REQUEST_DELAY", "0.05"))
+MAX_WORKERS = int(os.getenv("BREADTH_WORKERS", "8"))
+REQUEST_DELAY = float(os.getenv("BREADTH_REQUEST_DELAY", "0.03"))
 
 
-def previous_business_candidates(days: int = 12) -> list[str]:
-    today = datetime.now()
-    return [
-        (today - timedelta(days=offset)).strftime("%Y%m%d")
-        for offset in range(days)
+def normalize_market(value: str) -> str:
+    text = str(value or "").upper().strip()
+
+    if "KOSDAQ" in text:
+        return "KOSDAQ"
+
+    if "KOSPI" in text:
+        return "KOSPI"
+
+    return ""
+
+
+def load_listing() -> pd.DataFrame:
+    listing = fdr.StockListing("KRX")
+
+    if listing is None or listing.empty:
+        raise RuntimeError("FinanceDataReader KRX 종목 목록이 비어 있습니다.")
+
+    code_column = None
+
+    for candidate in ["Code", "Symbol", "종목코드"]:
+        if candidate in listing.columns:
+            code_column = candidate
+            break
+
+    if code_column is None:
+        raise RuntimeError(
+            f"종목코드 열을 찾지 못했습니다: {listing.columns.tolist()}"
+        )
+
+    market_column = None
+
+    for candidate in ["Market", "시장구분", "MarketId"]:
+        if candidate in listing.columns:
+            market_column = candidate
+            break
+
+    if market_column is None:
+        raise RuntimeError(
+            f"시장 구분 열을 찾지 못했습니다: {listing.columns.tolist()}"
+        )
+
+    output = listing[[code_column, market_column]].copy()
+    output.columns = ["ticker", "market"]
+    output["ticker"] = (
+        output["ticker"]
+        .astype(str)
+        .str.replace(".0", "", regex=False)
+        .str.extract(r"(\d+)")[0]
+        .str.zfill(6)
+    )
+    output["market"] = output["market"].map(normalize_market)
+
+    output = output[
+        output["market"].isin(["KOSPI", "KOSDAQ"])
+        & output["ticker"].str.fullmatch(r"\d{6}", na=False)
     ]
 
-
-def resolve_latest_trading_date() -> str:
-    for date_text in previous_business_candidates():
-        try:
-            frame = stock.get_market_ohlcv_by_ticker(
-                date_text,
-                market="KOSPI",
-            )
-            if frame is not None and not frame.empty:
-                return date_text
-        except Exception:
-            continue
-
-    raise RuntimeError("최근 거래일을 찾지 못했습니다.")
-
-
-def get_tickers(market: str, trading_date: str) -> list[str]:
-    tickers = stock.get_market_ticker_list(
-        trading_date,
-        market=market,
+    return (
+        output.drop_duplicates(["market", "ticker"])
+        .sort_values(["market", "ticker"])
+        .reset_index(drop=True)
     )
-    return sorted(set(str(ticker).zfill(6) for ticker in tickers))
+
+
+def load_index_history(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    frame = fdr.DataReader(symbol, start_date, end_date)
+
+    if frame is None or frame.empty or "Close" not in frame.columns:
+        raise RuntimeError(f"{symbol} 지수 데이터를 가져오지 못했습니다.")
+
+    frame = frame.copy()
+    frame.index = pd.to_datetime(frame.index, errors="coerce")
+    frame["Close"] = pd.to_numeric(frame["Close"], errors="coerce")
+    frame = frame.dropna(subset=["Close"]).sort_index()
+
+    if frame.empty:
+        raise RuntimeError(f"{symbol} 유효 지수 데이터가 없습니다.")
+
+    return frame
+
+
+def resolve_latest_trading_date() -> tuple[str, dict[str, pd.DataFrame]]:
+    today = datetime.now()
+    start_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")
+    end_date = today.strftime("%Y-%m-%d")
+
+    index_frames = {
+        market: load_index_history(symbol, start_date, end_date)
+        for market, symbol in INDEX_SYMBOLS.items()
+    }
+
+    latest_dates = [
+        frame.index.max()
+        for frame in index_frames.values()
+        if not frame.empty
+    ]
+
+    if not latest_dates:
+        raise RuntimeError("최근 거래일을 찾지 못했습니다.")
+
+    latest_date = min(latest_dates)
+    return latest_date.strftime("%Y-%m-%d"), index_frames
 
 
 def fetch_one_ticker(
@@ -61,18 +139,13 @@ def fetch_one_ticker(
     end_date: str,
 ) -> dict | None:
     try:
-        frame = stock.get_market_ohlcv_by_date(
-            start_date,
-            end_date,
-            ticker,
-            adjusted=True,
-        )
+        frame = fdr.DataReader(ticker, start_date, end_date)
 
-        if frame is None or frame.empty or "종가" not in frame.columns:
+        if frame is None or frame.empty or "Close" not in frame.columns:
             return None
 
         close = pd.to_numeric(
-            frame["종가"],
+            frame["Close"],
             errors="coerce",
         ).dropna()
 
@@ -91,24 +164,16 @@ def fetch_one_ticker(
         def above_ma(window: int) -> bool | None:
             if len(close) < window:
                 return None
+
             return latest_close >= float(
                 close.tail(window).mean()
             )
 
-        high_52w = (
-            float(close.tail(250).max())
-            if len(close) >= 20
-            else latest_close
-        )
-        low_52w = (
-            float(close.tail(250).min())
-            if len(close) >= 20
-            else latest_close
-        )
+        recent_52w = close.tail(250)
 
         return {
             "ticker": ticker,
-            "date": close.index[-1],
+            "date": pd.to_datetime(close.index[-1]),
             "close": latest_close,
             "previous_close": previous_close,
             "advance": latest_close > previous_close,
@@ -118,8 +183,8 @@ def fetch_one_ticker(
             "above_ma60": above_ma(60),
             "above_ma120": above_ma(120),
             "above_ma200": above_ma(200),
-            "new_high_52w": latest_close >= high_52w,
-            "new_low_52w": latest_close <= low_52w,
+            "new_high_52w": latest_close >= float(recent_52w.max()),
+            "new_low_52w": latest_close <= float(recent_52w.min()),
         }
 
     except Exception:
@@ -131,18 +196,24 @@ def fetch_one_ticker(
 
 
 def fetch_market_rows(
+    listing: pd.DataFrame,
     market: str,
     trading_date: str,
 ) -> pd.DataFrame:
-    tickers = get_tickers(market, trading_date)
+    tickers = (
+        listing.loc[listing["market"] == market, "ticker"]
+        .dropna()
+        .astype(str)
+        .tolist()
+    )
 
     if not tickers:
         return pd.DataFrame()
 
-    end_dt = datetime.strptime(trading_date, "%Y%m%d")
+    end_dt = datetime.strptime(trading_date, "%Y-%m-%d")
     start_date = (
         end_dt - timedelta(days=LOOKBACK_CALENDAR_DAYS)
-    ).strftime("%Y%m%d")
+    ).strftime("%Y-%m-%d")
 
     rows: list[dict] = []
 
@@ -183,52 +254,10 @@ def safe_percent(series: pd.Series) -> float | None:
     if valid.empty:
         return None
 
-    return round(float(valid.astype(bool).mean() * 100), 2)
-
-
-def fetch_index_close(
-    index_code: str,
-    trading_date: str,
-) -> tuple[float | None, float | None]:
-    end_dt = datetime.strptime(trading_date, "%Y%m%d")
-    start_date = (
-        end_dt - timedelta(days=14)
-    ).strftime("%Y%m%d")
-
-    try:
-        frame = stock.get_index_ohlcv_by_date(
-            start_date,
-            trading_date,
-            index_code,
-        )
-
-        if frame is None or frame.empty:
-            return None, None
-
-        close = pd.to_numeric(
-            frame["종가"],
-            errors="coerce",
-        ).dropna()
-
-        if close.empty:
-            return None, None
-
-        latest = float(close.iloc[-1])
-        previous = (
-            float(close.iloc[-2])
-            if len(close) >= 2
-            else latest
-        )
-        change_pct = (
-            (latest / previous - 1) * 100
-            if previous > 0
-            else None
-        )
-
-        return latest, change_pct
-
-    except Exception:
-        return None, None
+    return round(
+        float(valid.astype(bool).mean() * 100),
+        2,
+    )
 
 
 def load_history(path: Path) -> pd.DataFrame:
@@ -252,10 +281,6 @@ def append_deduplicated(
         ignore_index=True,
     )
 
-    for column in subset:
-        if column in combined.columns:
-            combined[column] = combined[column].astype(str)
-
     combined = (
         combined.drop_duplicates(
             subset=subset,
@@ -277,11 +302,15 @@ def previous_ad_line(
     history: pd.DataFrame,
     market: str,
 ) -> float:
-    if history.empty or "ad_line" not in history.columns:
+    if (
+        history.empty
+        or "market" not in history.columns
+        or "ad_line" not in history.columns
+    ):
         return 0.0
 
     rows = history[
-        history.get("market", "") == market
+        history["market"].astype(str) == market
     ].copy()
 
     if rows.empty:
@@ -295,39 +324,73 @@ def previous_ad_line(
     return float(values.iloc[-1]) if not values.empty else 0.0
 
 
+def index_values(
+    frame: pd.DataFrame,
+    trading_date: str,
+) -> tuple[float, float]:
+    target_date = pd.Timestamp(trading_date)
+    usable = frame[frame.index <= target_date].copy()
+
+    if usable.empty:
+        raise RuntimeError(f"{trading_date} 지수 데이터가 없습니다.")
+
+    latest = float(usable["Close"].iloc[-1])
+    previous = (
+        float(usable["Close"].iloc[-2])
+        if len(usable) >= 2
+        else latest
+    )
+    change_pct = (
+        (latest / previous - 1) * 100
+        if previous > 0
+        else 0.0
+    )
+
+    return latest, change_pct
+
+
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    trading_date = resolve_latest_trading_date()
-    date_iso = datetime.strptime(
-        trading_date,
-        "%Y%m%d",
-    ).strftime("%Y-%m-%d")
+    listing = load_listing()
+    trading_date, index_frames = resolve_latest_trading_date()
 
-    print(f"최신 거래일: {date_iso}")
+    print(f"최신 거래일: {trading_date}")
+    print(f"종목 목록: {len(listing)}개")
 
     old_history = load_history(BREADTH_HISTORY)
     summary_rows = []
     close_rows = []
 
-    for market, index_code in MARKETS.items():
+    for market in ["KOSPI", "KOSDAQ"]:
         print(f"{market} 수집 시작")
+
         rows = fetch_market_rows(
+            listing,
             market,
             trading_date,
         )
 
         if rows.empty:
-            print(f"{market}: 수집 결과 없음")
-            continue
+            raise RuntimeError(f"{market} 종목 데이터를 수집하지 못했습니다.")
+
+        rows = rows[
+            rows["date"].dt.strftime("%Y-%m-%d")
+            == trading_date
+        ].copy()
+
+        if rows.empty:
+            raise RuntimeError(
+                f"{market} 최신 거래일 종목 데이터가 없습니다."
+            )
 
         advancers = int(rows["advance"].sum())
         decliners = int(rows["decline"].sum())
         unchanged = int(rows["unchanged"].sum())
         ad_net = advancers - decliners
 
-        index_close, index_change_pct = fetch_index_close(
-            index_code,
+        index_close, index_change_pct = index_values(
+            index_frames[market],
             trading_date,
         )
 
@@ -338,37 +401,21 @@ def main() -> None:
 
         summary_rows.append(
             {
-                "date": date_iso,
+                "date": trading_date,
                 "market": market,
-                "index_close": index_close,
-                "index_change_pct": (
-                    round(index_change_pct, 3)
-                    if index_change_pct is not None
-                    else None
-                ),
-                "above_ma20": safe_percent(
-                    rows["above_ma20"]
-                ),
-                "above_ma60": safe_percent(
-                    rows["above_ma60"]
-                ),
-                "above_ma120": safe_percent(
-                    rows["above_ma120"]
-                ),
-                "above_ma200": safe_percent(
-                    rows["above_ma200"]
-                ),
+                "index_close": round(index_close, 2),
+                "index_change_pct": round(index_change_pct, 3),
+                "above_ma20": safe_percent(rows["above_ma20"]),
+                "above_ma60": safe_percent(rows["above_ma60"]),
+                "above_ma120": safe_percent(rows["above_ma120"]),
+                "above_ma200": safe_percent(rows["above_ma200"]),
                 "advancers": advancers,
                 "decliners": decliners,
                 "unchanged": unchanged,
                 "ad_net": ad_net,
                 "ad_line": ad_line,
-                "new_high_52w": int(
-                    rows["new_high_52w"].sum()
-                ),
-                "new_low_52w": int(
-                    rows["new_low_52w"].sum()
-                ),
+                "new_high_52w": int(rows["new_high_52w"].sum()),
+                "new_low_52w": int(rows["new_low_52w"].sum()),
                 "universe_count": int(len(rows)),
                 "updated_at": datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S"
@@ -376,21 +423,15 @@ def main() -> None:
             }
         )
 
-        market_close = rows[
-            ["ticker", "close"]
-        ].copy()
+        market_close = rows[["ticker", "close"]].copy()
         market_close.insert(0, "market", market)
-        market_close.insert(0, "date", date_iso)
+        market_close.insert(0, "date", trading_date)
         close_rows.append(market_close)
 
         print(
             f"{market}: {len(rows)}종목, "
-            f"상승 {advancers}, 하락 {decliners}"
-        )
-
-    if not summary_rows:
-        raise RuntimeError(
-            "KOSPI/KOSDAQ Breadth 데이터를 만들지 못했습니다."
+            f"상승 {advancers}, 하락 {decliners}, "
+            f"보합 {unchanged}"
         )
 
     summary_df = pd.DataFrame(summary_rows)
@@ -407,14 +448,10 @@ def main() -> None:
         "decliners",
     ]
 
-    invalid = summary_df[
-        summary_df[required_columns].isna().any(axis=1)
-    ]
-
-    if not invalid.empty:
+    if summary_df[required_columns].isna().any().any():
         raise RuntimeError(
-            "필수 Breadth 값에 결측치가 있습니다:\n"
-            + invalid[required_columns].to_string(index=False)
+            "최신 Breadth 행에 결측치가 있습니다.\n"
+            + summary_df[required_columns].to_string(index=False)
         )
 
     append_deduplicated(
@@ -423,16 +460,16 @@ def main() -> None:
         subset=["market", "date"],
     )
 
-    if close_rows:
-        close_df = pd.concat(
-            close_rows,
-            ignore_index=True,
-        )
-        append_deduplicated(
-            BREADTH_CLOSE_HISTORY,
-            close_df,
-            subset=["market", "ticker", "date"],
-        )
+    close_df = pd.concat(
+        close_rows,
+        ignore_index=True,
+    )
+
+    append_deduplicated(
+        BREADTH_CLOSE_HISTORY,
+        close_df,
+        subset=["market", "ticker", "date"],
+    )
 
     print("Breadth 업데이트 완료")
     print(summary_df.to_string(index=False))
