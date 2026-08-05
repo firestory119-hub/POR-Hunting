@@ -23,7 +23,7 @@ except Exception:
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Alpha v46", page_icon="📈", layout="wide")
+st.set_page_config(page_title="POR Alpha v46.1", page_icon="📈", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -1485,7 +1485,7 @@ with st.sidebar:
     bull_por = st.number_input("낙관 POR", value=12.0, step=0.5)
     target_multiple_manual = st.number_input("목표 배수 직접입력(선택)", value=0.0, step=0.5)
 
-    st.caption("v46: 목표 배수 직접 입력 + 현재 배수의 역사적 위치까지 확인합니다.")
+    st.caption("v46.1: 목표 배수 직접 입력 + 현재 배수의 역사적 위치 안정판입니다.")
 
 
 # =========================
@@ -2135,7 +2135,7 @@ if run:
 
             # 선택 기간 내 현재 배수의 역사적 위치
             valid_ratio_history = pd.to_numeric(
-                plot_df.get("ratio"),
+                displayed_df.get("ratio"),
                 errors="coerce",
             ).dropna()
             valid_ratio_history = valid_ratio_history[
