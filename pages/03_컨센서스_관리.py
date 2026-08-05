@@ -2,13 +2,14 @@ import base64
 import io
 import json
 import os
+import re
 import urllib.error
 import urllib.request
-from datetime import date
-from pathlib import Path
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
+from openpyxl import load_workbook
 
 
 st.set_page_config(
@@ -17,302 +18,306 @@ st.set_page_config(
     layout="wide",
 )
 
-DATA_DIR = Path("data")
-CONSENSUS_XLSX = DATA_DIR / "consensus.xlsx"
-
+DATA_DIR = "data"
+CONSENSUS_XLSX = os.path.join(DATA_DIR, "consensus.xlsx")
 GITHUB_OWNER = "firestory119-hub"
 GITHUB_REPO = "POR-Hunting"
+GITHUB_PATH = "data/consensus.xlsx"
 GITHUB_BRANCH = "main"
-GITHUB_FILE_PATH = "data/consensus.xlsx"
-
-YEAR_COLUMNS = [
-    "2026E",
-    "2027E",
-    "2028E",
-    "2029E",
-    "2030E",
-]
-
-COLUMNS = [
-    "종목명",
-    "종목코드",
-    *YEAR_COLUMNS,
-    "목표POR",
-    "출처",
-    "업데이트일",
-    "비고",
-]
+SHEET_NAME = "컨센서스입력"
+HEADER_ROW = 2
 
 
 def clean_ticker(value) -> str:
-    if value is None:
-        return ""
-
-    text = str(value).strip().replace(".0", "")
+    text = str(value or "").strip().replace(".0", "")
     digits = "".join(ch for ch in text if ch.isdigit())
-
     return digits.zfill(6) if digits else ""
 
 
-def empty_consensus() -> pd.DataFrame:
-    return pd.DataFrame(columns=COLUMNS)
-
-
-@st.cache_data(show_spinner=False, ttl=60)
+@st.cache_data(show_spinner=False, ttl=300)
 def load_consensus() -> pd.DataFrame:
-    if not CONSENSUS_XLSX.exists():
-        return empty_consensus()
+    if not os.path.exists(CONSENSUS_XLSX):
+        return pd.DataFrame()
 
     try:
         df = pd.read_excel(
             CONSENSUS_XLSX,
-            sheet_name="컨센서스입력",
-            header=1,
+            sheet_name=SHEET_NAME,
+            header=HEADER_ROW - 1,
             dtype={"종목코드": str},
             engine="openpyxl",
         )
     except Exception:
-        return empty_consensus()
+        return pd.DataFrame()
 
-    for column in COLUMNS:
-        if column not in df.columns:
-            df[column] = None
+    if "종목코드" in df.columns:
+        df["종목코드"] = df["종목코드"].map(clean_ticker)
 
-    df = df[COLUMNS].copy()
-    df["종목코드"] = df["종목코드"].map(clean_ticker)
+    year_columns = [
+        column
+        for column in df.columns
+        if re.fullmatch(r"\d{4}E?", str(column).strip())
+    ]
 
-    for column in YEAR_COLUMNS + ["목표POR"]:
+    for column in year_columns:
         df[column] = pd.to_numeric(
             df[column],
             errors="coerce",
         )
 
-    df["업데이트일"] = pd.to_datetime(
-        df["업데이트일"],
-        errors="coerce",
-    ).dt.date
-
-    df = df[
-        df["종목명"].notna()
-        | df["종목코드"].astype(str).ne("")
-    ].copy()
-
-    return df.reset_index(drop=True)
-
-
-def make_excel_bytes(df: pd.DataFrame) -> bytes:
-    save_df = df.copy()
-
-    for column in COLUMNS:
-        if column not in save_df.columns:
-            save_df[column] = None
-
-    save_df = save_df[COLUMNS]
-    save_df["종목코드"] = save_df["종목코드"].map(
-        clean_ticker
-    )
-
-    save_df = save_df[
-        save_df["종목명"].astype(str).str.strip().ne("")
-        & save_df["종목코드"].astype(str).str.len().eq(6)
-    ].copy()
-
-    save_df = save_df.drop_duplicates(
-        subset=["종목코드"],
-        keep="last",
-    )
-
-    buffer = io.BytesIO()
-
-    with pd.ExcelWriter(
-        buffer,
-        engine="openpyxl",
-    ) as writer:
-        title_df = pd.DataFrame(
-            [["POR Hunting 연도별 영업이익 컨센서스"]],
-        )
-        title_df.to_excel(
-            writer,
-            sheet_name="컨센서스입력",
-            index=False,
-            header=False,
-            startrow=0,
+    if "목표POR" in df.columns:
+        df["목표POR"] = pd.to_numeric(
+            df["목표POR"],
+            errors="coerce",
         )
 
-        save_df.to_excel(
-            writer,
-            sheet_name="컨센서스입력",
-            index=False,
-            startrow=1,
+    if "업데이트일" in df.columns:
+        df["업데이트일"] = pd.to_datetime(
+            df["업데이트일"],
+            errors="coerce",
         )
 
-        guide_df = pd.DataFrame(
-            [
-                ["항목", "설명"],
-                ["종목명", "앱의 종목명과 동일하게 입력"],
-                ["종목코드", "6자리 종목코드"],
-                ["2026E~2030E", "연도별 예상 영업이익(억원)"],
-                ["목표POR", "종목별 목표 POR. 비우면 앱 기본값 사용"],
-                ["출처", "증권사, 회사 가이던스, 사용자 추정 등"],
-                ["업데이트일", "컨센서스를 수정한 날짜"],
-                ["비고", "가정과 참고사항"],
-            ]
+    return df
+
+
+def sort_dataframe(
+    df: pd.DataFrame,
+    sort_option: str,
+    selected_year: str | None,
+) -> pd.DataFrame:
+    result = df.copy()
+
+    if sort_option == "종목명 가나다순" and "종목명" in result.columns:
+        return result.sort_values(
+            "종목명",
+            ascending=True,
+            kind="stable",
+            na_position="last",
+        ).reset_index(drop=True)
+
+    if sort_option == "종목명 역순" and "종목명" in result.columns:
+        return result.sort_values(
+            "종목명",
+            ascending=False,
+            kind="stable",
+            na_position="last",
+        ).reset_index(drop=True)
+
+    if sort_option == "최근 업데이트순" and "업데이트일" in result.columns:
+        return result.sort_values(
+            "업데이트일",
+            ascending=False,
+            kind="stable",
+            na_position="last",
+        ).reset_index(drop=True)
+
+    if sort_option == "오래된 업데이트순" and "업데이트일" in result.columns:
+        return result.sort_values(
+            "업데이트일",
+            ascending=True,
+            kind="stable",
+            na_position="last",
+        ).reset_index(drop=True)
+
+    if sort_option == "목표 POR 높은순" and "목표POR" in result.columns:
+        return result.sort_values(
+            "목표POR",
+            ascending=False,
+            kind="stable",
+            na_position="last",
+        ).reset_index(drop=True)
+
+    if sort_option == "목표 POR 낮은순" and "목표POR" in result.columns:
+        return result.sort_values(
+            "목표POR",
+            ascending=True,
+            kind="stable",
+            na_position="last",
+        ).reset_index(drop=True)
+
+    if (
+        sort_option == "예상 영업이익 높은순"
+        and selected_year
+        and selected_year in result.columns
+    ):
+        return result.sort_values(
+            selected_year,
+            ascending=False,
+            kind="stable",
+            na_position="last",
+        ).reset_index(drop=True)
+
+    if (
+        sort_option == "예상 영업이익 낮은순"
+        and selected_year
+        and selected_year in result.columns
+    ):
+        return result.sort_values(
+            selected_year,
+            ascending=True,
+            kind="stable",
+            na_position="last",
+        ).reset_index(drop=True)
+
+    return result.reset_index(drop=True)
+
+
+def dataframe_to_excel_bytes(
+    edited_df: pd.DataFrame,
+) -> bytes:
+    workbook = load_workbook(CONSENSUS_XLSX)
+
+    if SHEET_NAME not in workbook.sheetnames:
+        raise RuntimeError(
+            f"엑셀에 '{SHEET_NAME}' 시트가 없습니다."
         )
-        guide_df.to_excel(
-            writer,
-            sheet_name="사용방법",
-            index=False,
-            header=False,
-        )
 
-        workbook = writer.book
-        ws = workbook["컨센서스입력"]
-        guide_ws = workbook["사용방법"]
+    sheet = workbook[SHEET_NAME]
 
-        ws.merge_cells("A1:K1")
-        ws["A1"] = "POR Hunting 연도별 영업이익 컨센서스"
+    header_map = {}
 
-        title_fill = "17365D"
-        header_fill = "1F4E78"
-        input_fill = "FFF2CC"
+    for cell in sheet[HEADER_ROW]:
+        if cell.value is not None:
+            header_map[str(cell.value).strip()] = cell.column
 
-        from openpyxl.styles import Alignment, Font, PatternFill
+    required_columns = [
+        column
+        for column in edited_df.columns
+        if column in header_map
+    ]
 
-        ws["A1"].fill = PatternFill(
-            "solid",
-            fgColor=title_fill,
-        )
-        ws["A1"].font = Font(
-            bold=True,
-            color="FFFFFF",
-            size=15,
-        )
-        ws["A1"].alignment = Alignment(
-            horizontal="center",
-        )
+    last_existing_row = sheet.max_row
+    first_data_row = HEADER_ROW + 1
 
-        for cell in ws[2]:
-            cell.fill = PatternFill(
-                "solid",
-                fgColor=header_fill,
-            )
-            cell.font = Font(
-                bold=True,
-                color="FFFFFF",
-            )
-            cell.alignment = Alignment(
-                horizontal="center",
-            )
-
-        for row in ws.iter_rows(
-            min_row=3,
-            min_col=3,
-            max_col=10,
+    if last_existing_row >= first_data_row:
+        for row_number in range(
+            first_data_row,
+            last_existing_row + 1,
         ):
-            for cell in row:
-                cell.fill = PatternFill(
-                    "solid",
-                    fgColor=input_fill,
+            for column_name in required_columns:
+                sheet.cell(
+                    row=row_number,
+                    column=header_map[column_name],
+                ).value = None
+
+    for row_offset, (_, row) in enumerate(
+        edited_df.iterrows(),
+        start=first_data_row,
+    ):
+        for column_name in required_columns:
+            value = row.get(column_name)
+
+            if pd.isna(value):
+                value = None
+            elif column_name == "종목코드":
+                value = clean_ticker(value)
+            elif column_name == "업데이트일":
+                timestamp = pd.to_datetime(
+                    value,
+                    errors="coerce",
+                )
+                value = (
+                    timestamp.to_pydatetime()
+                    if pd.notna(timestamp)
+                    else None
+                )
+            elif re.fullmatch(
+                r"\d{4}E?",
+                str(column_name).strip(),
+            ):
+                numeric_value = pd.to_numeric(
+                    value,
+                    errors="coerce",
+                )
+                value = (
+                    float(numeric_value)
+                    if pd.notna(numeric_value)
+                    else None
+                )
+            elif column_name == "목표POR":
+                numeric_value = pd.to_numeric(
+                    value,
+                    errors="coerce",
+                )
+                value = (
+                    float(numeric_value)
+                    if pd.notna(numeric_value)
+                    else None
                 )
 
-        widths = {
-            "A": 15,
-            "B": 12,
-            "C": 12,
-            "D": 12,
-            "E": 12,
-            "F": 12,
-            "G": 12,
-            "H": 10,
-            "I": 24,
-            "J": 14,
-            "K": 34,
-        }
+            sheet.cell(
+                row=row_offset,
+                column=header_map[column_name],
+            ).value = value
 
-        for column, width in widths.items():
-            ws.column_dimensions[column].width = width
-
-        ws.freeze_panes = "A3"
-
-        for cell in ws["B"][2:]:
-            cell.number_format = "@"
-
-        for column in "CDEFG":
-            for cell in ws[column][2:]:
-                cell.number_format = "#,##0"
-
-        for cell in ws["H"][2:]:
-            cell.number_format = "0.0"
-
-        for cell in ws["J"][2:]:
-            cell.number_format = "yyyy-mm-dd"
-
-        guide_ws.column_dimensions["A"].width = 20
-        guide_ws.column_dimensions["B"].width = 70
-
-    return buffer.getvalue()
+    output = io.BytesIO()
+    workbook.save(output)
+    return output.getvalue()
 
 
-def github_headers(token: str) -> dict:
-    return {
+def save_excel_to_github(
+    excel_bytes: bytes,
+) -> tuple[bool, str]:
+    try:
+        token = str(st.secrets["GITHUB_TOKEN"]).strip()
+    except Exception:
+        return (
+            False,
+            "Streamlit Secrets에 GITHUB_TOKEN이 없습니다.",
+        )
+
+    if not token:
+        return (
+            False,
+            "Streamlit Secrets의 GITHUB_TOKEN이 비어 있습니다.",
+        )
+
+    api_url = (
+        f"https://api.github.com/repos/"
+        f"{GITHUB_OWNER}/{GITHUB_REPO}/contents/{GITHUB_PATH}"
+    )
+
+    headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "POR-Hunting-Consensus-Manager",
+        "User-Agent": "POR-Alpha-Consensus",
         "Content-Type": "application/json",
     }
 
-
-def get_github_sha(token: str) -> str | None:
-    url = (
-        f"https://api.github.com/repos/{GITHUB_OWNER}/"
-        f"{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
-        f"?ref={GITHUB_BRANCH}"
-    )
-
-    request = urllib.request.Request(
-        url,
-        method="GET",
-        headers=github_headers(token),
-    )
+    sha = None
 
     try:
+        request = urllib.request.Request(
+            api_url,
+            method="GET",
+            headers=headers,
+        )
+
         with urllib.request.urlopen(
             request,
             timeout=20,
         ) as response:
-            payload = json.loads(
+            current_file = json.loads(
                 response.read().decode("utf-8")
             )
-            return payload.get("sha")
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            return None
+            sha = current_file.get("sha")
 
-        detail = exc.read().decode(
-            "utf-8",
-            errors="ignore",
-        )[:300]
-        raise RuntimeError(
-            f"GitHub 파일 확인 실패({exc.code}): {detail}"
-        ) from exc
-
-
-def save_to_github(
-    file_bytes: bytes,
-    token: str,
-) -> None:
-    sha = get_github_sha(token)
-
-    url = (
-        f"https://api.github.com/repos/{GITHUB_OWNER}/"
-        f"{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
-    )
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            detail = error.read().decode(
+                "utf-8",
+                errors="ignore",
+            )[:400]
+            return (
+                False,
+                f"GitHub 파일 확인 실패({error.code}): {detail}",
+            )
 
     payload = {
-        "message": "Update consensus workbook",
+        "message": "Update consensus data",
         "content": base64.b64encode(
-            file_bytes
+            excel_bytes
         ).decode("ascii"),
         "branch": GITHUB_BRANCH,
     }
@@ -321,10 +326,10 @@ def save_to_github(
         payload["sha"] = sha
 
     request = urllib.request.Request(
-        url,
+        api_url,
         data=json.dumps(payload).encode("utf-8"),
         method="PUT",
-        headers=github_headers(token),
+        headers=headers,
     )
 
     try:
@@ -332,202 +337,340 @@ def save_to_github(
             request,
             timeout=40,
         ) as response:
-            if response.status not in (200, 201):
-                raise RuntimeError(
-                    f"GitHub 저장 응답 코드: {response.status}"
+            if response.status in (200, 201):
+                return (
+                    True,
+                    "컨센서스를 GitHub에 저장했습니다.",
                 )
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode(
+
+            return (
+                False,
+                f"GitHub 저장 응답 코드: {response.status}",
+            )
+
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(
             "utf-8",
             errors="ignore",
         )[:500]
-        raise RuntimeError(
-            f"GitHub 저장 실패({exc.code}): {detail}"
-        ) from exc
+        return (
+            False,
+            f"GitHub 저장 실패({error.code}): {detail}",
+        )
+
+    except Exception as error:
+        return False, f"GitHub 저장 실패: {error}"
 
 
 st.title("📝 컨센서스 관리")
 st.caption(
-    "종목별 연도 예상 영업이익을 앱에서 수정하고 "
+    "종목별 연도 예상 영업이익을 수정하고 "
     "GitHub의 data/consensus.xlsx에 바로 저장합니다."
 )
 
-consensus_df = load_consensus()
+source_df = load_consensus()
 
-c1, c2, c3 = st.columns(3)
-c1.metric("등록 종목", f"{len(consensus_df):,}개")
-c2.metric(
-    "영업이익 입력 수",
-    f"{int(consensus_df[YEAR_COLUMNS].notna().sum().sum()):,}개",
+if source_df.empty:
+    st.error(
+        "data/consensus.xlsx의 컨센서스입력 시트를 읽지 못했습니다."
+    )
+    st.stop()
+
+year_columns = [
+    str(column)
+    for column in source_df.columns
+    if re.fullmatch(r"\d{4}E?", str(column).strip())
+]
+
+registered_count = (
+    source_df["종목명"].notna().sum()
+    if "종목명" in source_df.columns
+    else len(source_df)
 )
-c3.metric(
+
+input_count = (
+    int(source_df[year_columns].notna().sum().sum())
+    if year_columns
+    else 0
+)
+
+latest_update = (
+    source_df["업데이트일"].max()
+    if "업데이트일" in source_df.columns
+    else pd.NaT
+)
+
+metric1, metric2, metric3 = st.columns(3)
+metric1.metric("등록 종목", f"{registered_count:,}개")
+metric2.metric("영업이익 입력 수", f"{input_count:,}개")
+metric3.metric(
     "최근 업데이트",
     (
-        str(consensus_df["업데이트일"].dropna().max())
-        if not consensus_df.empty
-        and consensus_df["업데이트일"].notna().any()
+        latest_update.strftime("%Y-%m-%d")
+        if pd.notna(latest_update)
         else "-"
     ),
 )
 
 st.info(
-    "새 종목을 추가하려면 표의 맨 아래 빈 행에 입력하세요. "
+    "새 종목은 표의 맨 아래 빈 행에 입력하세요. "
     "종목코드는 반드시 6자리로 입력합니다."
 )
 
-edited_df = st.data_editor(
-    consensus_df,
-    num_rows="dynamic",
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "종목명": st.column_config.TextColumn(
+control1, control2, control3, control4 = st.columns(
+    [2, 1.4, 1.2, 1.2]
+)
+
+with control1:
+    search_text = st.text_input(
+        "종목 검색",
+        placeholder="종목명 또는 종목코드",
+    ).strip()
+
+with control2:
+    sort_option = st.selectbox(
+        "정렬 기준",
+        [
+            "종목명 가나다순",
+            "종목명 역순",
+            "최근 업데이트순",
+            "오래된 업데이트순",
+            "목표 POR 높은순",
+            "목표 POR 낮은순",
+            "예상 영업이익 높은순",
+            "예상 영업이익 낮은순",
+        ],
+        index=0,
+    )
+
+with control3:
+    selected_year = st.selectbox(
+        "영업이익 정렬 연도",
+        year_columns if year_columns else ["없음"],
+        disabled=not bool(year_columns),
+    )
+
+with control4:
+    filter_option = st.selectbox(
+        "추가 필터",
+        [
+            "전체",
+            "목표 POR 미입력",
+            "업데이트일 미입력",
+            "30일 이상 미갱신",
+            "영업이익 입력 종목만",
+        ],
+    )
+
+working_df = source_df.copy()
+
+if search_text:
+    name_mask = (
+        working_df.get(
             "종목명",
-            required=True,
-        ),
-        "종목코드": st.column_config.TextColumn(
+            pd.Series("", index=working_df.index),
+        )
+        .astype(str)
+        .str.contains(
+            search_text,
+            case=False,
+            na=False,
+        )
+    )
+
+    ticker_mask = (
+        working_df.get(
             "종목코드",
-            required=True,
-            help="6자리 종목코드",
-        ),
-        "2026E": st.column_config.NumberColumn(
-            "2026E 영업이익(억)",
-            min_value=-100000.0,
-            step=10.0,
-            format="%.0f",
-        ),
-        "2027E": st.column_config.NumberColumn(
-            "2027E 영업이익(억)",
-            min_value=-100000.0,
-            step=10.0,
-            format="%.0f",
-        ),
-        "2028E": st.column_config.NumberColumn(
-            "2028E 영업이익(억)",
-            min_value=-100000.0,
-            step=10.0,
-            format="%.0f",
-        ),
-        "2029E": st.column_config.NumberColumn(
-            "2029E 영업이익(억)",
-            min_value=-100000.0,
-            step=10.0,
-            format="%.0f",
-        ),
-        "2030E": st.column_config.NumberColumn(
-            "2030E 영업이익(억)",
-            min_value=-100000.0,
-            step=10.0,
-            format="%.0f",
-        ),
-        "목표POR": st.column_config.NumberColumn(
+            pd.Series("", index=working_df.index),
+        )
+        .astype(str)
+        .str.contains(
+            search_text,
+            case=False,
+            na=False,
+        )
+    )
+
+    working_df = working_df[
+        name_mask | ticker_mask
+    ].copy()
+
+if filter_option == "목표 POR 미입력":
+    working_df = working_df[
+        pd.to_numeric(
+            working_df.get("목표POR"),
+            errors="coerce",
+        ).isna()
+    ].copy()
+
+elif filter_option == "업데이트일 미입력":
+    working_df = working_df[
+        pd.to_datetime(
+            working_df.get("업데이트일"),
+            errors="coerce",
+        ).isna()
+    ].copy()
+
+elif filter_option == "30일 이상 미갱신":
+    cutoff = (
+        pd.Timestamp.today().normalize()
+        - pd.Timedelta(days=30)
+    )
+    update_values = pd.to_datetime(
+        working_df.get("업데이트일"),
+        errors="coerce",
+    )
+    working_df = working_df[
+        update_values.isna() | (update_values < cutoff)
+    ].copy()
+
+elif filter_option == "영업이익 입력 종목만":
+    if year_columns:
+        working_df = working_df[
+            working_df[year_columns].notna().any(axis=1)
+        ].copy()
+
+working_df = sort_dataframe(
+    working_df,
+    sort_option,
+    selected_year if year_columns else None,
+)
+
+display_columns = [
+    column
+    for column in [
+        "종목명",
+        "종목코드",
+        *year_columns,
+        "목표POR",
+        "출처",
+        "업데이트일",
+        "비고",
+    ]
+    if column in working_df.columns
+]
+
+column_config = {
+    "종목명": st.column_config.TextColumn(
+        "종목명",
+        required=True,
+    ),
+    "종목코드": st.column_config.TextColumn(
+        "종목코드",
+        help="6자리 숫자",
+        validate=r"^\d{6}$",
+    ),
+}
+
+for year in year_columns:
+    column_config[year] = st.column_config.NumberColumn(
+        f"{year} 영업이익(억)",
+        format="%,.1f",
+        step=1.0,
+    )
+
+if "목표POR" in display_columns:
+    column_config["목표POR"] = (
+        st.column_config.NumberColumn(
             "목표 POR",
-            min_value=0.0,
-            max_value=100.0,
-            step=0.5,
             format="%.1f",
-        ),
-        "출처": st.column_config.TextColumn(
-            "출처",
-        ),
-        "업데이트일": st.column_config.DateColumn(
+            step=0.5,
+        )
+    )
+
+if "업데이트일" in display_columns:
+    column_config["업데이트일"] = (
+        st.column_config.DateColumn(
             "업데이트일",
             format="YYYY-MM-DD",
-        ),
-        "비고": st.column_config.TextColumn(
-            "비고",
-            width="large",
-        ),
-    },
-    key="consensus_editor",
+        )
+    )
+
+edited_visible = st.data_editor(
+    working_df[display_columns],
+    use_container_width=True,
+    hide_index=True,
+    num_rows="dynamic",
+    column_config=column_config,
+    key="consensus_main_editor_sorted",
 )
 
-save_col, reload_col, download_col = st.columns(
-    [1, 1, 2]
+st.caption(
+    f"현재 화면: {len(working_df):,}개 종목 · "
+    "정렬 상태에서 수정한 뒤 GitHub에 저장하세요."
 )
 
-with save_col:
-    save_clicked = st.button(
+button1, button2, button3 = st.columns(
+    [1.1, 1.1, 2.2]
+)
+
+with button1:
+    save_button = st.button(
         "💾 GitHub에 저장",
         type="primary",
         use_container_width=True,
     )
 
-with reload_col:
+with button2:
     if st.button(
         "🔄 다시 읽기",
         use_container_width=True,
     ):
-        st.cache_data.clear()
+        load_consensus.clear()
         st.rerun()
 
-excel_bytes = make_excel_bytes(edited_df)
+with button3:
+    try:
+        current_excel_bytes = Path(
+            CONSENSUS_XLSX
+        ).read_bytes()
+    except Exception:
+        current_excel_bytes = b""
 
-with download_col:
     st.download_button(
         "📥 현재 컨센서스 엑셀 다운로드",
-        data=excel_bytes,
+        data=current_excel_bytes,
         file_name="consensus.xlsx",
         mime=(
             "application/vnd.openxmlformats-officedocument."
             "spreadsheetml.sheet"
         ),
         use_container_width=True,
+        disabled=not bool(current_excel_bytes),
     )
 
-if save_clicked:
-    invalid_codes = edited_df[
-        edited_df["종목명"].astype(str).str.strip().ne("")
-        & edited_df["종목코드"].map(clean_ticker).str.len().ne(6)
-    ]
-
-    if not invalid_codes.empty:
+if save_button:
+    if search_text or filter_option != "전체":
         st.error(
-            "종목코드가 6자리가 아닌 행이 있습니다."
+            "검색 또는 추가 필터가 적용된 상태에서는 일부 종목만 보여 "
+            "전체 저장이 차단됩니다. 검색어를 지우고 추가 필터를 "
+            "'전체'로 바꾼 뒤 저장하세요."
         )
-        st.stop()
-
-    try:
-        token = str(
-            st.secrets["GITHUB_TOKEN"]
-        ).strip()
-    except Exception:
-        st.error(
-            "Streamlit Secrets에 GITHUB_TOKEN이 없습니다."
-        )
-        st.stop()
-
-    if not token:
-        st.error(
-            "Streamlit Secrets의 GITHUB_TOKEN이 비어 있습니다."
-        )
-        st.stop()
-
-    try:
-        with st.spinner(
-            "GitHub에 consensus.xlsx를 저장하는 중..."
-        ):
-            save_to_github(
-                excel_bytes,
-                token,
+    else:
+        try:
+            excel_bytes = dataframe_to_excel_bytes(
+                edited_visible
+            )
+            success, message = save_excel_to_github(
+                excel_bytes
             )
 
-        st.success(
-            "저장 완료! 잠시 후 메인 app에서 "
-            "새 컨센서스가 자동 반영됩니다."
-        )
-        st.cache_data.clear()
+            if success:
+                st.success(message)
+                st.cache_data.clear()
+            else:
+                st.error(message)
 
-    except Exception as exc:
-        st.error(str(exc))
+        except Exception as error:
+            st.error(f"엑셀 생성 실패: {error}")
 
 with st.expander("사용 방법"):
     st.markdown(
         """
-1. 종목별로 2026E~2030E 예상 영업이익을 입력합니다.
-2. 종목별 목표 POR가 있으면 입력합니다.
-3. **GitHub에 저장**을 누릅니다.
-4. 메인 `app`에서 수동 예상 영업이익을 `0`으로 두면 저장된 컨센서스를 자동 사용합니다.
-5. 메인 앱의 **저장된 연도별 영업이익 컨센서스** 표에서 전체 연도를 확인합니다.
+1. 기본 화면은 **종목명 가나다순**입니다.
+2. 상단에서 종목 검색, 정렬 기준, 연도, 추가 필터를 선택합니다.
+3. 표의 값을 직접 수정하거나 맨 아래에 새 종목을 추가합니다.
+4. 저장할 때는 검색어를 비우고 추가 필터를 `전체`로 변경합니다.
+5. `GitHub에 저장`을 누르면 `data/consensus.xlsx`가 갱신됩니다.
         """
     )
