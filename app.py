@@ -23,7 +23,7 @@ except Exception:
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Alpha v45", page_icon="📈", layout="wide")
+st.set_page_config(page_title="POR Alpha v45.1", page_icon="📈", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -1471,7 +1471,15 @@ with st.sidebar:
         step=100.0,
         key=f"expected_price_input_{sidebar_stock_key}",
     )
-    target_por_slider = st.slider(f"목표 {valuation_metric}", 1.0, 30.0, 8.0, 0.5)
+    target_por_slider = st.number_input(
+        f"목표 {valuation_metric}",
+        min_value=0.5,
+        max_value=300.0,
+        value=8.0,
+        step=0.5,
+        format="%.1f",
+        help="원하는 목표 배수를 직접 입력하세요.",
+    )
     bear_por = st.number_input("보수 POR", value=5.0, step=0.5)
     base_por = st.number_input("적정 POR", value=8.0, step=0.5)
     bull_por = st.number_input("낙관 POR", value=12.0, step=0.5)
