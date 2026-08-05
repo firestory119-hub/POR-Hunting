@@ -3,19 +3,25 @@ name: Update Market Breadth
 on:
   workflow_dispatch:
   schedule:
-    - cron: "20 9 * * 1-5"
+    - cron: "45 8 * * 1-5"
 
 permissions:
   contents: write
 
+concurrency:
+  group: update-market-breadth
+  cancel-in-progress: false
+
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -26,21 +32,62 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas pykrx requests finance-datareader
+          pip install pandas finance-datareader
 
       - name: Build breadth data
         env:
-          BREADTH_WORKERS: "20"
+          BREADTH_WORKERS: "8"
+          BREADTH_REQUEST_DELAY: "0.03"
         run: python update_breadth.py
+
+      - name: Validate output
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          from pathlib import Path
+
+          path = Path("data/breadth_history.csv")
+          if not path.exists():
+              raise SystemExit("breadth_history.csv가 없습니다.")
+
+          df = pd.read_csv(path)
+          required = [
+              "date", "market", "index_close",
+              "above_ma20", "above_ma60",
+              "above_ma120", "above_ma200",
+              "advancers", "decliners",
+          ]
+
+          missing = [c for c in required if c not in df.columns]
+          if missing:
+              raise SystemExit(f"필수 열 누락: {missing}")
+
+          latest = (
+              df.sort_values("date")
+              .groupby("market")
+              .tail(1)
+          )
+
+          if latest[required].isna().any().any():
+              raise SystemExit(
+                  "최신 행에 결측치가 있습니다.\n"
+                  + latest[required].to_string(index=False)
+              )
+
+          print(latest[required].to_string(index=False))
+          PY
 
       - name: Commit breadth data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/breadth_close_history.csv data/breadth_history.csv
+
+          git add data/breadth_history.csv data/breadth_close_history.csv
+
           if git diff --cached --quiet; then
             echo "No breadth changes"
           else
             git commit -m "Update market breadth"
-            git push
+            git pull --rebase origin main
+            git push origin main
           fi
