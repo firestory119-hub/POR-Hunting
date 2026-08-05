@@ -1,383 +1,441 @@
-"""Fast incremental KOSPI/KOSDAQ market-breadth builder (no KRX login).
-
-First run
----------
-Downloads roughly 330 daily closes per listed stock from Naver in parallel and
-stores a rolling local cache in ``data/breadth_close_history.csv``.
-
-Later runs
-----------
-Reads the newest all-stock prices already maintained by this repository in
-``data/market_data.csv`` and appends only one new trading-day row per stock.
-Therefore normal daily runs avoid thousands of HTTP calls and usually finish
-quickly.
-"""
-
 from __future__ import annotations
 
 import os
-import re
-import threading
 import time
-import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
-import requests
-
-try:
-    import FinanceDataReader as fdr
-except Exception:
-    fdr = None
-
-DATA_DIR = "data"
-MARKET_DATA_FILE = os.path.join(DATA_DIR, "market_data.csv")
-CLOSE_FILE = os.path.join(DATA_DIR, "breadth_close_history.csv")
-OUTPUT_FILE = os.path.join(DATA_DIR, "breadth_history.csv")
-
-MARKETS = ("KOSPI", "KOSDAQ")
-WINDOWS = (20, 60, 120, 200)
-HISTORY_TRADING_DAYS = 330
-KEEP_CALENDAR_DAYS = 560
-MAX_WORKERS = int(os.getenv("BREADTH_WORKERS", "28"))
-CHECKPOINT_EVERY = 100
-NAVER_CHART_URL = "https://fchart.stock.naver.com/sise.nhn"
-
-os.makedirs(DATA_DIR, exist_ok=True)
-_thread_local = threading.local()
+from pykrx import stock
 
 
-def clean_ticker(value) -> str:
-    return str(value).strip().replace(".0", "").zfill(6)
+DATA_DIR = Path("data")
+BREADTH_HISTORY = DATA_DIR / "breadth_history.csv"
+BREADTH_CLOSE_HISTORY = DATA_DIR / "breadth_close_history.csv"
+
+MARKETS = {
+    "KOSPI": "1001",
+    "KOSDAQ": "2001",
+}
+
+LOOKBACK_CALENDAR_DAYS = 430
+MAX_WORKERS = int(os.getenv("BREADTH_WORKERS", "12"))
+REQUEST_DELAY = float(os.getenv("BREADTH_REQUEST_DELAY", "0.05"))
 
 
-def get_session() -> requests.Session:
-    session = getattr(_thread_local, "session", None)
-    if session is None:
-        session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=40, pool_maxsize=40)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
-        _thread_local.session = session
-    return session
+def previous_business_candidates(days: int = 12) -> list[str]:
+    today = datetime.now()
+    return [
+        (today - timedelta(days=offset)).strftime("%Y%m%d")
+        for offset in range(days)
+    ]
 
 
-def decode_xml(raw: bytes) -> str:
-    for encoding in ("euc-kr", "cp949", "utf-8"):
+def resolve_latest_trading_date() -> str:
+    for date_text in previous_business_candidates():
         try:
-            text = raw.decode(encoding)
-            break
-        except UnicodeDecodeError:
+            frame = stock.get_market_ohlcv_by_ticker(
+                date_text,
+                market="KOSPI",
+            )
+            if frame is not None and not frame.empty:
+                return date_text
+        except Exception:
             continue
-    else:
-        text = raw.decode("utf-8", errors="replace")
 
-    text = text.lstrip("\ufeff\r\n\t ")
-    text = re.sub(r"^<\?xml[^>]*\?>", "", text, count=1).lstrip()
-    return text
+    raise RuntimeError("최근 거래일을 찾지 못했습니다.")
 
 
-def market_ticker_map() -> dict[str, str]:
-    """Build KOSPI/KOSDAQ ticker map without KRX login.
+def get_tickers(market: str, trading_date: str) -> list[str]:
+    tickers = stock.get_market_ticker_list(
+        trading_date,
+        market=market,
+    )
+    return sorted(set(str(ticker).zfill(6) for ticker in tickers))
 
-    Primary source is FinanceDataReader's exchange listing. If that is
-    temporarily unavailable, fall back to cached ticker/market pairs from the
-    existing close-history file.
-    """
-    mapping: dict[str, str] = {}
-    errors: list[str] = []
 
-    if fdr is not None:
-        for market in MARKETS:
-            try:
-                listing = fdr.StockListing(market)
-                code_col = next(
-                    (c for c in ("Code", "Symbol", "종목코드") if c in listing.columns),
-                    None,
-                )
-                if code_col is None:
-                    raise RuntimeError(f"종목코드 열을 찾지 못함: {list(listing.columns)}")
-
-                codes = (
-                    listing[code_col]
-                    .dropna()
-                    .astype(str)
-                    .str.replace(r"\.0$", "", regex=True)
-                    .str.zfill(6)
-                )
-                for ticker in codes:
-                    mapping[clean_ticker(ticker)] = market
-                print(f"{market} 종목목록: {len(codes):,}개", flush=True)
-            except Exception as exc:
-                errors.append(f"{market}: {exc}")
-
-    # A partially completed first run can resume even if the listing endpoint
-    # is temporarily unavailable.
-    if not mapping and os.path.exists(CLOSE_FILE):
-        try:
-            cached = pd.read_csv(CLOSE_FILE, dtype={"ticker": str})
-            if {"ticker", "market"}.issubset(cached.columns):
-                cached = cached.dropna(subset=["ticker", "market"])
-                cached = cached[cached["market"].isin(MARKETS)]
-                mapping = {
-                    clean_ticker(row.ticker): str(row.market)
-                    for row in cached[["ticker", "market"]].drop_duplicates().itertuples(index=False)
-                }
-                if mapping:
-                    print(f"캐시 종목목록 사용: {len(mapping):,}개", flush=True)
-        except Exception as exc:
-            errors.append(f"cache: {exc}")
-
-    if not mapping:
-        raise RuntimeError(
-            "KOSPI/KOSDAQ 종목 목록을 가져오지 못했습니다. "
-            + " / ".join(errors)
+def fetch_one_ticker(
+    ticker: str,
+    start_date: str,
+    end_date: str,
+) -> dict | None:
+    try:
+        frame = stock.get_market_ohlcv_by_date(
+            start_date,
+            end_date,
+            ticker,
+            adjusted=True,
         )
-    return mapping
+
+        if frame is None or frame.empty or "종가" not in frame.columns:
+            return None
+
+        close = pd.to_numeric(
+            frame["종가"],
+            errors="coerce",
+        ).dropna()
+
+        close = close[close > 0]
+
+        if len(close) < 20:
+            return None
+
+        latest_close = float(close.iloc[-1])
+        previous_close = (
+            float(close.iloc[-2])
+            if len(close) >= 2
+            else latest_close
+        )
+
+        def above_ma(window: int) -> bool | None:
+            if len(close) < window:
+                return None
+            return latest_close >= float(
+                close.tail(window).mean()
+            )
+
+        high_52w = (
+            float(close.tail(250).max())
+            if len(close) >= 20
+            else latest_close
+        )
+        low_52w = (
+            float(close.tail(250).min())
+            if len(close) >= 20
+            else latest_close
+        )
+
+        return {
+            "ticker": ticker,
+            "date": close.index[-1],
+            "close": latest_close,
+            "previous_close": previous_close,
+            "advance": latest_close > previous_close,
+            "decline": latest_close < previous_close,
+            "unchanged": latest_close == previous_close,
+            "above_ma20": above_ma(20),
+            "above_ma60": above_ma(60),
+            "above_ma120": above_ma(120),
+            "above_ma200": above_ma(200),
+            "new_high_52w": latest_close >= high_52w,
+            "new_low_52w": latest_close <= low_52w,
+        }
+
+    except Exception:
+        return None
+
+    finally:
+        if REQUEST_DELAY > 0:
+            time.sleep(REQUEST_DELAY)
 
 
-def load_close_history() -> pd.DataFrame:
-    columns = ["date", "market", "ticker", "close", "change"]
-    if not os.path.exists(CLOSE_FILE):
-        return pd.DataFrame(columns=columns)
+def fetch_market_rows(
+    market: str,
+    trading_date: str,
+) -> pd.DataFrame:
+    tickers = get_tickers(market, trading_date)
 
-    df = pd.read_csv(CLOSE_FILE, dtype={"ticker": str})
-    for col in columns:
-        if col not in df.columns:
-            df[col] = pd.NA
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["ticker"] = df["ticker"].map(clean_ticker)
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    df["change"] = pd.to_numeric(df["change"], errors="coerce")
-    return (
-        df.dropna(subset=["date", "market", "ticker", "close"])[columns]
-        .drop_duplicates(["date", "market", "ticker"], keep="last")
+    if not tickers:
+        return pd.DataFrame()
+
+    end_dt = datetime.strptime(trading_date, "%Y%m%d")
+    start_date = (
+        end_dt - timedelta(days=LOOKBACK_CALENDAR_DAYS)
+    ).strftime("%Y%m%d")
+
+    rows: list[dict] = []
+
+    with ThreadPoolExecutor(
+        max_workers=MAX_WORKERS
+    ) as executor:
+        futures = {
+            executor.submit(
+                fetch_one_ticker,
+                ticker,
+                start_date,
+                trading_date,
+            ): ticker
+            for ticker in tickers
+        }
+
+        for number, future in enumerate(
+            as_completed(futures),
+            start=1,
+        ):
+            result = future.result()
+
+            if result:
+                rows.append(result)
+
+            if number % 100 == 0:
+                print(
+                    f"{market}: {number}/{len(tickers)} 처리, "
+                    f"성공 {len(rows)}"
+                )
+
+    return pd.DataFrame(rows)
+
+
+def safe_percent(series: pd.Series) -> float | None:
+    valid = series.dropna()
+
+    if valid.empty:
+        return None
+
+    return round(float(valid.astype(bool).mean() * 100), 2)
+
+
+def fetch_index_close(
+    index_code: str,
+    trading_date: str,
+) -> tuple[float | None, float | None]:
+    end_dt = datetime.strptime(trading_date, "%Y%m%d")
+    start_date = (
+        end_dt - timedelta(days=14)
+    ).strftime("%Y%m%d")
+
+    try:
+        frame = stock.get_index_ohlcv_by_date(
+            start_date,
+            trading_date,
+            index_code,
+        )
+
+        if frame is None or frame.empty:
+            return None, None
+
+        close = pd.to_numeric(
+            frame["종가"],
+            errors="coerce",
+        ).dropna()
+
+        if close.empty:
+            return None, None
+
+        latest = float(close.iloc[-1])
+        previous = (
+            float(close.iloc[-2])
+            if len(close) >= 2
+            else latest
+        )
+        change_pct = (
+            (latest / previous - 1) * 100
+            if previous > 0
+            else None
+        )
+
+        return latest, change_pct
+
+    except Exception:
+        return None, None
+
+
+def load_history(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
+
+
+def append_deduplicated(
+    path: Path,
+    new_rows: pd.DataFrame,
+    subset: list[str],
+) -> None:
+    old = load_history(path)
+    combined = pd.concat(
+        [old, new_rows],
+        ignore_index=True,
+    )
+
+    for column in subset:
+        if column in combined.columns:
+            combined[column] = combined[column].astype(str)
+
+    combined = (
+        combined.drop_duplicates(
+            subset=subset,
+            keep="last",
+        )
+        .sort_values(subset)
+        .reset_index(drop=True)
+    )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_csv(
+        path,
+        index=False,
+        encoding="utf-8-sig",
     )
 
 
-def save_close_history(df: pd.DataFrame) -> None:
-    df = df.sort_values(["market", "ticker", "date"]).copy()
-    df["change"] = df.groupby(["market", "ticker"], sort=False)["close"].pct_change() * 100
-    df.to_csv(CLOSE_FILE, index=False, encoding="utf-8-sig")
+def previous_ad_line(
+    history: pd.DataFrame,
+    market: str,
+) -> float:
+    if history.empty or "ad_line" not in history.columns:
+        return 0.0
+
+    rows = history[
+        history.get("market", "") == market
+    ].copy()
+
+    if rows.empty:
+        return 0.0
+
+    values = pd.to_numeric(
+        rows["ad_line"],
+        errors="coerce",
+    ).dropna()
+
+    return float(values.iloc[-1]) if not values.empty else 0.0
 
 
-def fetch_naver_history(ticker: str, market: str) -> pd.DataFrame:
-    params = {
-        "symbol": ticker,
-        "timeframe": "day",
-        "count": str(HISTORY_TRADING_DAYS),
-        "requestType": "0",
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150 Safari/537.36",
-        "Referer": f"https://finance.naver.com/item/main.naver?code={ticker}",
-        "Accept": "text/xml,application/xml,text/html;q=0.9,*/*;q=0.8",
-    }
+def main() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    last_error: Exception | None = None
-    for attempt in range(3):
-        try:
-            response = get_session().get(
-                NAVER_CHART_URL,
-                params=params,
-                headers=headers,
-                timeout=(5, 15),
-            )
-            response.raise_for_status()
-            root = ET.fromstring(decode_xml(response.content))
-            rows = []
-            for item in root.findall(".//item"):
-                parts = item.attrib.get("data", "").split("|")
-                if len(parts) < 6:
-                    continue
-                date_text, _open, _high, _low, close, _volume = parts[:6]
-                rows.append((date_text, close))
+    trading_date = resolve_latest_trading_date()
+    date_iso = datetime.strptime(
+        trading_date,
+        "%Y%m%d",
+    ).strftime("%Y-%m-%d")
 
-            if not rows:
-                raise ValueError("빈 차트 응답")
+    print(f"최신 거래일: {date_iso}")
 
-            frame = pd.DataFrame(rows, columns=["date", "close"])
-            frame["date"] = pd.to_datetime(frame["date"], format="%Y%m%d", errors="coerce")
-            frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
-            frame = frame.dropna(subset=["date", "close"])
-            frame = frame[frame["close"] > 0].sort_values("date")
-            frame["market"] = market
-            frame["ticker"] = ticker
-            frame["change"] = frame["close"].pct_change() * 100
-            return frame[["date", "market", "ticker", "close", "change"]]
-        except Exception as exc:
-            last_error = exc
-            time.sleep(0.5 * (attempt + 1))
+    old_history = load_history(BREADTH_HISTORY)
+    summary_rows = []
+    close_rows = []
 
-    print(f"{market} {ticker} 초기수집 실패: {last_error}", flush=True)
-    return pd.DataFrame(columns=["date", "market", "ticker", "close", "change"])
+    for market, index_code in MARKETS.items():
+        print(f"{market} 수집 시작")
+        rows = fetch_market_rows(
+            market,
+            trading_date,
+        )
 
-
-def bootstrap_history(ticker_map: dict[str, str], old: pd.DataFrame) -> pd.DataFrame:
-    existing_counts = old.groupby("ticker")["date"].nunique().to_dict() if not old.empty else {}
-    jobs = [
-        (ticker, market)
-        for ticker, market in ticker_map.items()
-        if existing_counts.get(ticker, 0) < 200
-    ]
-
-    if not jobs:
-        return old
-
-    print(f"최초/보충 수집 대상: {len(jobs):,}개 (동시 작업 {MAX_WORKERS}개)", flush=True)
-    frames = [old] if not old.empty else []
-    completed = 0
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(fetch_naver_history, ticker, market): (ticker, market)
-            for ticker, market in jobs
-        }
-        for future in as_completed(futures):
-            completed += 1
-            try:
-                frame = future.result()
-                if not frame.empty:
-                    frames.append(frame)
-            except Exception as exc:
-                ticker, market = futures[future]
-                print(f"{market} {ticker} 예외: {exc}", flush=True)
-
-            if completed % CHECKPOINT_EVERY == 0 or completed == len(jobs):
-                merged = pd.concat(frames, ignore_index=True) if frames else old
-                merged = merged.drop_duplicates(["date", "market", "ticker"], keep="last")
-                cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=KEEP_CALENDAR_DAYS)
-                merged = merged[merged["date"] >= cutoff]
-                save_close_history(merged)
-                frames = [merged]
-                print(f"초기수집 진행: {completed:,}/{len(jobs):,} (중간저장 완료)", flush=True)
-
-    return frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True)
-
-
-def append_latest_market_data(close_df: pd.DataFrame, ticker_map: dict[str, str]) -> pd.DataFrame:
-    if not os.path.exists(MARKET_DATA_FILE):
-        print("data/market_data.csv가 없어 당일 증분 추가를 건너뜁니다.", flush=True)
-        return close_df
-
-    market = pd.read_csv(MARKET_DATA_FILE, dtype={"종목코드": str})
-    required = {"종목코드", "현재가"}
-    if not required.issubset(market.columns):
-        print("market_data.csv에 종목코드/현재가 열이 없어 증분 추가를 건너뜁니다.", flush=True)
-        return close_df
-
-    market["ticker"] = market["종목코드"].map(clean_ticker)
-    market["close"] = pd.to_numeric(market["현재가"], errors="coerce")
-    market["market"] = market["ticker"].map(ticker_map)
-
-    if "기준일" in market.columns:
-        market["date"] = pd.to_datetime(market["기준일"], errors="coerce")
-    else:
-        market["date"] = pd.Timestamp.today().normalize()
-
-    latest = market.dropna(subset=["date", "market", "ticker", "close"])
-    latest = latest[latest["close"] > 0][["date", "market", "ticker", "close"]]
-    latest = latest.drop_duplicates(["date", "market", "ticker"], keep="last")
-    latest["change"] = pd.NA
-
-    if latest.empty:
-        print("market_data.csv에서 유효한 최신 가격을 찾지 못했습니다.", flush=True)
-        return close_df
-
-    latest_date = latest["date"].max()
-    cached_date = close_df["date"].max() if not close_df.empty else pd.NaT
-    if pd.notna(cached_date) and latest_date <= cached_date:
-        print(f"신규 거래일 없음: 캐시 {cached_date:%Y-%m-%d}, market_data {latest_date:%Y-%m-%d}", flush=True)
-        return close_df
-
-    out = pd.concat([close_df, latest], ignore_index=True)
-    out = out.drop_duplicates(["date", "market", "ticker"], keep="last")
-    cutoff = latest_date - pd.Timedelta(days=KEEP_CALENDAR_DAYS)
-    out = out[out["date"] >= cutoff]
-    print(f"신규 거래일 {latest_date:%Y-%m-%d}: {len(latest):,}개 종목 추가", flush=True)
-    return out
-
-
-def calculate_breadth(close_df: pd.DataFrame) -> pd.DataFrame:
-    rows: list[dict] = []
-
-    for market_name in MARKETS:
-        m = close_df[close_df["market"] == market_name].copy()
-        if m.empty:
+        if rows.empty:
+            print(f"{market}: 수집 결과 없음")
             continue
 
-        m = m.sort_values(["ticker", "date"])
-        for window in WINDOWS:
-            m[f"ma{window}"] = m.groupby("ticker", sort=False)["close"].transform(
-                lambda series, w=window: series.rolling(w, min_periods=w).mean()
-            )
+        advancers = int(rows["advance"].sum())
+        decliners = int(rows["decline"].sum())
+        unchanged = int(rows["unchanged"].sum())
+        ad_net = advancers - decliners
 
-        m["high_252"] = m.groupby("ticker", sort=False)["close"].transform(
-            lambda series: series.rolling(252, min_periods=120).max()
-        )
-        m["low_252"] = m.groupby("ticker", sort=False)["close"].transform(
-            lambda series: series.rolling(252, min_periods=120).min()
+        index_close, index_change_pct = fetch_index_close(
+            index_code,
+            trading_date,
         )
 
-        ad_line = 0
-        for date, day in m.groupby("date", sort=True):
-            advancers = int((day["change"] > 0).sum())
-            decliners = int((day["change"] < 0).sum())
-            unchanged = int((day["change"].fillna(0) == 0).sum())
-            ad_net = advancers - decliners
-            ad_line += ad_net
+        ad_line = previous_ad_line(
+            old_history,
+            market,
+        ) + ad_net
 
-            row = {
-                "date": date,
-                "market": market_name,
+        summary_rows.append(
+            {
+                "date": date_iso,
+                "market": market,
+                "index_close": index_close,
+                "index_change_pct": (
+                    round(index_change_pct, 3)
+                    if index_change_pct is not None
+                    else None
+                ),
+                "above_ma20": safe_percent(
+                    rows["above_ma20"]
+                ),
+                "above_ma60": safe_percent(
+                    rows["above_ma60"]
+                ),
+                "above_ma120": safe_percent(
+                    rows["above_ma120"]
+                ),
+                "above_ma200": safe_percent(
+                    rows["above_ma200"]
+                ),
                 "advancers": advancers,
                 "decliners": decliners,
                 "unchanged": unchanged,
                 "ad_net": ad_net,
                 "ad_line": ad_line,
-                "new_high_52w": int((day["close"] >= day["high_252"]).fillna(False).sum()),
-                "new_low_52w": int((day["close"] <= day["low_252"]).fillna(False).sum()),
+                "new_high_52w": int(
+                    rows["new_high_52w"].sum()
+                ),
+                "new_low_52w": int(
+                    rows["new_low_52w"].sum()
+                ),
+                "universe_count": int(len(rows)),
+                "updated_at": datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
             }
+        )
 
-            for window in WINDOWS:
-                ma = day[f"ma{window}"]
-                valid = ma.notna()
-                row[f"above_ma{window}"] = (
-                    round(float((day.loc[valid, "close"] > ma.loc[valid]).mean() * 100), 4)
-                    if valid.any()
-                    else None
-                )
-            rows.append(row)
+        market_close = rows[
+            ["ticker", "close"]
+        ].copy()
+        market_close.insert(0, "market", market)
+        market_close.insert(0, "date", date_iso)
+        close_rows.append(market_close)
 
-    if not rows:
-        raise RuntimeError("Breadth 계산 결과가 없습니다.")
+        print(
+            f"{market}: {len(rows)}종목, "
+            f"상승 {advancers}, 하락 {decliners}"
+        )
 
-    out = pd.DataFrame(rows).sort_values(["market", "date"]).reset_index(drop=True)
-    out.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
-    return out
+    if not summary_rows:
+        raise RuntimeError(
+            "KOSPI/KOSDAQ Breadth 데이터를 만들지 못했습니다."
+        )
 
+    summary_df = pd.DataFrame(summary_rows)
 
-def main() -> None:
-    started = time.time()
-    ticker_map = market_ticker_map()
-    close_df = load_close_history()
+    required_columns = [
+        "date",
+        "market",
+        "index_close",
+        "above_ma20",
+        "above_ma60",
+        "above_ma120",
+        "above_ma200",
+        "advancers",
+        "decliners",
+    ]
 
-    # Only stocks without a usable 200-day cache are downloaded from Naver.
-    close_df = bootstrap_history(ticker_map, close_df)
+    invalid = summary_df[
+        summary_df[required_columns].isna().any(axis=1)
+    ]
 
-    # On normal daily runs, append all current prices from one local CSV read.
-    close_df = append_latest_market_data(close_df, ticker_map)
-    close_df = close_df.drop_duplicates(["date", "market", "ticker"], keep="last")
-    save_close_history(close_df)
+    if not invalid.empty:
+        raise RuntimeError(
+            "필수 Breadth 값에 결측치가 있습니다:\n"
+            + invalid[required_columns].to_string(index=False)
+        )
 
-    result = calculate_breadth(close_df)
-    elapsed = time.time() - started
-    latest = result["date"].max()
-    print(
-        f"완료: {OUTPUT_FILE} / {len(result):,}행 / 최신 {latest:%Y-%m-%d} / {elapsed:.1f}초",
-        flush=True,
+    append_deduplicated(
+        BREADTH_HISTORY,
+        summary_df,
+        subset=["market", "date"],
     )
+
+    if close_rows:
+        close_df = pd.concat(
+            close_rows,
+            ignore_index=True,
+        )
+        append_deduplicated(
+            BREADTH_CLOSE_HISTORY,
+            close_df,
+            subset=["market", "ticker", "date"],
+        )
+
+    print("Breadth 업데이트 완료")
+    print(summary_df.to_string(index=False))
 
 
 if __name__ == "__main__":
