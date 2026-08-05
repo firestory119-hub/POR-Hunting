@@ -23,7 +23,7 @@ except Exception:
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Alpha v45.1", page_icon="📈", layout="wide")
+st.set_page_config(page_title="POR Alpha v46", page_icon="📈", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -1485,7 +1485,7 @@ with st.sidebar:
     bull_por = st.number_input("낙관 POR", value=12.0, step=0.5)
     target_multiple_manual = st.number_input("목표 배수 직접입력(선택)", value=0.0, step=0.5)
 
-    st.caption("v25: 미래 POR, 적정가, 텐베거, 간단 리포트까지 한 번에 확인합니다.")
+    st.caption("v46: 목표 배수 직접 입력 + 현재 배수의 역사적 위치까지 확인합니다.")
 
 
 # =========================
@@ -2133,11 +2133,72 @@ if run:
             if mean and mean > 0:
                 avg_discount = (current_por_calc / mean - 1) * 100
 
-            cpa, cpb, cpc, cpd = st.columns(4)
+            # 선택 기간 내 현재 배수의 역사적 위치
+            valid_ratio_history = pd.to_numeric(
+                plot_df.get("ratio"),
+                errors="coerce",
+            ).dropna()
+            valid_ratio_history = valid_ratio_history[
+                valid_ratio_history > 0
+            ]
+
+            current_percentile = None
+            if not valid_ratio_history.empty:
+                current_percentile = float(
+                    (
+                        valid_ratio_history
+                        <= float(current_por_calc)
+                    ).mean()
+                    * 100
+                )
+
+            cpa, cpb, cpc, cpd, cpe = st.columns(5)
             cpa.metric(calc_base_label, f"{calc_base_eok:,.1f}억")
             cpb.metric(f"현재 {valuation_metric}", f"{current_por_calc:.2f}배")
             cpc.metric(f"{chart_range} 평균 {valuation_metric}", f"{mean:.2f}배")
-            cpd.metric("평균 대비", f"{avg_discount:.1f}%" if avg_discount is not None else "-")
+            cpd.metric(
+                "평균 대비",
+                f"{avg_discount:.1f}%"
+                if avg_discount is not None
+                else "-",
+            )
+            cpe.metric(
+                "현재 역사적 위치",
+                (
+                    f"{current_percentile:.1f}%"
+                    if current_percentile is not None
+                    else "-"
+                ),
+            )
+
+            if current_percentile is not None:
+                st.progress(
+                    max(
+                        0,
+                        min(100, int(round(current_percentile))),
+                    ),
+                    text=(
+                        f"현재 {valuation_metric}는 {chart_range} 범위에서 "
+                        f"낮은 값부터 약 {current_percentile:.1f}% 위치입니다."
+                    ),
+                )
+
+                if current_percentile <= 20:
+                    st.success(
+                        f"현재 {valuation_metric}는 역사적 저평가 구간에 가깝습니다."
+                    )
+                elif current_percentile <= 40:
+                    st.info(
+                        f"현재 {valuation_metric}는 역사적 평균보다 낮은 구간입니다."
+                    )
+                elif current_percentile >= 80:
+                    st.warning(
+                        f"현재 {valuation_metric}는 역사적 고평가 구간에 가깝습니다."
+                    )
+                else:
+                    st.caption(
+                        f"현재 {valuation_metric}는 역사적 중간 범위에 위치합니다."
+                    )
 
             # 현재 POR 주변과 주요 POR 구간을 함께 표시
             por_values = sorted(set([
