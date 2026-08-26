@@ -23,7 +23,7 @@ except Exception:
 # =========================
 # 기본 설정
 # =========================
-st.set_page_config(page_title="POR Alpha v46.1", page_icon="📈", layout="wide")
+st.set_page_config(page_title="POR Alpha v46.2", page_icon="📈", layout="wide")
 
 DATA_DIR = "data"
 CORP_CACHE = os.path.join(DATA_DIR, "corp_codes.csv")
@@ -1119,7 +1119,13 @@ def render_breadth_page():
     with top1:
         market = st.radio("시장", ["KOSPI", "KOSDAQ"], horizontal=True, key="breadth_market")
     with top2:
-        period = st.radio("기간", ["6개월", "1년", "2년", "전체"], index=1, horizontal=True, key="breadth_period")
+        period = st.radio(
+            "기간",
+            ["6개월", "1년", "2년", "5년", "전체"],
+            index=3,
+            horizontal=True,
+            key="breadth_period",
+        )
 
     mdf = df[df["market"] == market].copy()
     if mdf.empty:
@@ -1127,7 +1133,12 @@ def render_breadth_page():
         return
 
     latest_date = mdf["date"].max()
-    months_map = {"6개월": 6, "1년": 12, "2년": 24}
+    months_map = {
+        "6개월": 6,
+        "1년": 12,
+        "2년": 24,
+        "5년": 60,
+    }
     if period in months_map:
         cutoff = latest_date - pd.DateOffset(months=months_map[period])
         plot_df = mdf[mdf["date"] >= cutoff].copy()
