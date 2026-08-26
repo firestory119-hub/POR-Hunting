@@ -10,26 +10,38 @@ jobs:
   backfill:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pandas requests finance-datareader
+
       - name: Build 5-year breadth history
         env:
           BREADTH_BACKFILL_YEARS: "5"
           BREADTH_BACKFILL_COUNT: "1650"
           BREADTH_WORKERS: "12"
         run: python backfill_breadth_5y.py
-      - name: Commit breadth data
+
+      - name: Commit breadth history only
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/breadth_close_history.csv data/breadth_history.csv
+
+          # 혹시 이전 실패 실행에서 작업트리에 대용량 파일이 생겨도 커밋하지 않음
+          git reset
+
+          git add data/breadth_history.csv
+
           if git diff --cached --quiet; then
             echo "No breadth changes"
           else
