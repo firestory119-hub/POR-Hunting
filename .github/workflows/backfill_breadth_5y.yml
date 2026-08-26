@@ -10,10 +10,11 @@ jobs:
   backfill:
     runs-on: ubuntu-latest
     timeout-minutes: 120
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -32,19 +33,55 @@ jobs:
           BREADTH_WORKERS: "12"
         run: python backfill_breadth_5y.py
 
-      - name: Commit breadth history only
+      - name: Commit and push breadth history safely
+        shell: bash
         run: |
+          set -e
+          cp data/breadth_history.csv /tmp/breadth_history.csv
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # 혹시 이전 실패 실행에서 작업트리에 대용량 파일이 생겨도 커밋하지 않음
-          git reset
+          git fetch origin main
+          git reset --hard origin/main
 
+          cp /tmp/breadth_history.csv data/breadth_history.csv
           git add data/breadth_history.csv
 
           if git diff --cached --quiet; then
             echo "No breadth changes"
-          else
-            git commit -m "Backfill 5-year market breadth"
-            git push
+            exit 0
           fi
+
+          git commit -m "Backfill 5-year market breadth"
+
+          for attempt in 1 2 3 4 5; do
+            echo "Push attempt ${attempt}/5"
+            if git push origin HEAD:main; then
+              echo "Push succeeded"
+              exit 0
+            fi
+
+            echo "Remote changed. Updating from latest main..."
+            git fetch origin main
+
+            if git rebase origin/main; then
+              :
+            else
+              git rebase --abort || true
+              git reset --hard origin/main
+              cp /tmp/breadth_history.csv data/breadth_history.csv
+              git add data/breadth_history.csv
+
+              if git diff --cached --quiet; then
+                echo "Latest main already contains the same breadth data"
+                exit 0
+              fi
+
+              git commit -m "Backfill 5-year market breadth"
+            fi
+            sleep $((attempt * 3))
+          done
+
+          echo "Push failed after 5 attempts"
+          exit 1
