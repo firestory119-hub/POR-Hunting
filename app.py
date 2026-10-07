@@ -674,11 +674,9 @@ def make_valuation_df(
     else:
         base_col = "equity"
 
-    # v26: 선택한 지표 기준으로 미래 기준값 반영
-    # POR=영업이익, PER=당기순이익, PBR=자본총계
-    if forward_year and forward_base_eok and forward_base_eok > 0:
-        fin_map.setdefault(int(forward_year), {})
-        fin_map[int(forward_year)][base_col] = forward_base_eok * 100_000_000
+    # v46.5: 미래 예상 기준값은 실제 POR/PER/PBR 시계열에 섞지 않습니다.
+    # 파란선/현재점은 financial_data.csv의 실제 재무만 사용하고,
+    # 미래 예상값은 projected_info(초록점)에서만 별도로 계산합니다.
 
     latest_available = {}
     latest_available_year = {}
@@ -704,12 +702,6 @@ def make_valuation_df(
     out["base_value"] = out["year"].map(latest_available)
     out["base_year"] = out["year"].map(latest_available_year)
     out["base_source"] = "financial_data.csv"
-
-    if forward_year and forward_base_eok and forward_base_eok > 0:
-        forward_mask = out["year"] >= int(forward_year)
-        out.loc[forward_mask, "base_value"] = forward_base_eok * 100_000_000
-        out.loc[forward_mask, "base_year"] = int(forward_year)
-        out.loc[forward_mask, "base_source"] = "예상 입력" if metric != "POR" else "예상 입력/컨센서스"
 
     out = out.dropna(subset=["base_value"])
     out = out[out["base_value"] > 0]
