@@ -817,7 +817,7 @@ def make_valuation_df(
     return out
 
 
-def plot_valuation(val_df: pd.DataFrame, title: str, metric: str, chart_range: str, projected_info: dict | None = None):
+def plot_valuation(val_df: pd.DataFrame, title: str, metric: str, chart_range: str, projected_info: dict | None = None, show_price: bool = False):
     val_df = val_df.sort_values("date").copy()
     latest_date = val_df["date"].max()
 
@@ -880,6 +880,30 @@ def plot_valuation(val_df: pd.DataFrame, title: str, metric: str, chart_range: s
             ),
         )
     )
+
+    # v46.8: 사용자가 선택한 경우에만 주가를 오른쪽 Y축에 표시
+    if show_price and "price" in plot_df.columns:
+        price_df = plot_df.dropna(subset=["price"]).copy()
+        price_df["price"] = pd.to_numeric(price_df["price"], errors="coerce")
+        price_df = price_df.dropna(subset=["price"])
+        price_df = price_df[price_df["price"] > 0]
+
+        if not price_df.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=price_df["date"],
+                    y=price_df["price"],
+                    mode="lines",
+                    name="주가",
+                    yaxis="y2",
+                    line=dict(width=1.5),
+                    hovertemplate=(
+                        "<b>%{x|%Y-%m-%d}</b><br>"
+                        "주가: %{y:,.0f}원"
+                        "<extra></extra>"
+                    ),
+                )
+            )
 
     latest = plot_df.iloc[-1]
     latest_custom = [[
@@ -982,6 +1006,14 @@ def plot_valuation(val_df: pd.DataFrame, title: str, metric: str, chart_range: s
         height=650,
         xaxis_title="Date",
         yaxis_title=f"{metric}(배)",
+        yaxis2=dict(
+            title="주가(원)" if show_price else "",
+            overlaying="y",
+            side="right",
+            showgrid=False,
+            visible=bool(show_price),
+            tickformat=",",
+        ),
         legend=dict(orientation="h", y=1.08, x=0.75),
         margin=dict(l=40, r=40, t=80, b=40),
         hovermode="x unified",
@@ -2072,18 +2104,27 @@ if run:
             hide_index=True,
         )
 
+    st.markdown("#### 차트 추가 표시")
+    show_price_chart = st.checkbox(
+        "📈 주가 그래프 같이 보기",
+        value=False,
+        key=f"show_price_chart_{ticker}_{valuation_metric}_{chart_mode}_{chart_range}",
+        help="체크하면 현재 Multiple 차트에 주가를 함께 표시합니다. 주가는 오른쪽 Y축(원)을 사용합니다.",
+    )
+
     fig, mean, std, stat_count, stat_start_date, displayed_df = plot_valuation(
         val_df,
         f"{name} {chart_mode} Multiple",
         valuation_metric,
         chart_range,
         projected_info,
+        show_price=show_price_chart,
     )
 
     st.plotly_chart(
         fig,
         width="stretch",
-        key=f"{ticker}_{valuation_metric}_{chart_mode}_{chart_range}_{forward_year}_{forward_base_eok}_{expected_mcap_eok}_{expected_price}_{projected_multiple}"
+        key=f"{ticker}_{valuation_metric}_{chart_mode}_{chart_range}_{forward_year}_{forward_base_eok}_{expected_mcap_eok}_{expected_price}_{projected_multiple}_{show_price_chart}"
     )
 
     s1, s2, s3, s4 = st.columns(4)
@@ -2123,35 +2164,48 @@ if run:
 
     if valuation_metric == "POR" and not consensus_df.empty:
         st.markdown("### 저장된 연도별 영업이익 컨센서스")
-        st.caption("예상 영업이익을 여기서 직접 수정한 뒤 **컨센서스 저장**을 누르면 GitHub의 data/consensus.xlsx에도 저장됩니다.")
+        st.caption("연도별 예상 영업이익과 목표 POR을 숫자 입력칸에서 직접 수정할 수 있습니다.")
 
         edit_source = consensus_df[["year", "operating_income_eok", "target_por"]].copy()
         edit_source["year"] = pd.to_numeric(edit_source["year"], errors="coerce").astype("Int64")
         edit_source["operating_income_eok"] = pd.to_numeric(edit_source["operating_income_eok"], errors="coerce")
         edit_source["target_por"] = pd.to_numeric(edit_source["target_por"], errors="coerce")
-        edit_source = edit_source.rename(columns={
-            "year": "연도",
-            "operating_income_eok": "예상 영업이익(억)",
-            "target_por": "목표 POR",
-        })
+        edit_source = edit_source.dropna(subset=["year"]).sort_values("year")
 
-        edited_consensus = st.data_editor(
-            edit_source,
-            hide_index=True,
-            use_container_width=True,
-            disabled=["연도"],
-            num_rows="fixed",
-            column_config={
-                "연도": st.column_config.NumberColumn("연도", format="%d"),
-                "예상 영업이익(억)": st.column_config.NumberColumn("예상 영업이익(억)", format="%.1f", step=1.0),
-                "목표 POR": st.column_config.NumberColumn("목표 POR", format="%.2f", step=0.1),
-            },
-            key=f"inline_consensus_editor_{ticker}",
-        )
+        # v46.7: data_editor 대신 확실하게 입력 가능한 number_input 사용
+        st.info("아래 숫자칸을 클릭해서 영업이익을 직접 입력하세요. 입력 즉시 아래 계산표가 바뀌고, 저장 버튼을 누르면 GitHub에도 반영됩니다.")
+        edited_rows = []
+        hdr = st.columns([1, 2, 1.5])
+        hdr[0].markdown("**연도**")
+        hdr[1].markdown("**예상 영업이익(억)**")
+        hdr[2].markdown("**목표 POR**")
+
+        for _, erow in edit_source.iterrows():
+            y = int(erow["year"])
+            oi0 = erow["operating_income_eok"]
+            tp0 = erow["target_por"]
+            oi0 = 0.0 if pd.isna(oi0) else float(oi0)
+            tp0 = float(target_por_slider) if pd.isna(tp0) or float(tp0) <= 0 else float(tp0)
+
+            c_y, c_oi, c_tp = st.columns([1, 2, 1.5])
+            c_y.markdown(f"**{y}E**")
+            oi_val = c_oi.number_input(
+                f"{y}E 예상 영업이익(억)", min_value=-1000000.0, max_value=1000000.0,
+                value=oi0, step=1.0, format="%.1f", key=f"inline_oi_{ticker}_{y}",
+                label_visibility="collapsed",
+            )
+            tp_val = c_tp.number_input(
+                f"{y}E 목표 POR", min_value=0.0, max_value=200.0,
+                value=tp0, step=0.1, format="%.2f", key=f"inline_tp_{ticker}_{y}",
+                label_visibility="collapsed",
+            )
+            edited_rows.append({"연도": y, "예상 영업이익(억)": oi_val, "목표 POR": tp_val})
+
+        edited_consensus = pd.DataFrame(edited_rows)
 
         save_c1, save_c2 = st.columns([1, 3])
         with save_c1:
-            if st.button("💾 컨센서스 저장", type="primary", use_container_width=True, key=f"save_inline_consensus_{ticker}"):
+            if st.button("💾 수정 컨센서스 저장", type="primary", use_container_width=True, key=f"save_inline_consensus_{ticker}"):
                 ok, msg = save_consensus_edits_to_github(ticker, edited_consensus)
                 if ok:
                     st.success(msg)
@@ -2160,7 +2214,7 @@ if run:
                 else:
                     st.error(msg)
         with save_c2:
-            st.caption("저장 후 현재 시총 기준 POR · 목표 시총 · 목표주가 · 상승여력 · 미래 초록점이 새 컨센서스로 다시 계산됩니다.")
+            st.caption("※ 숫자 입력만으로 아래 계산값은 즉시 변경됩니다. GitHub 영구 반영은 저장 버튼을 눌러야 합니다.")
 
         # 편집 중에도 아래 계산표는 입력값을 즉시 반영
         consensus_show = consensus_df.copy()
