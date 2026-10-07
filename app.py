@@ -5,7 +5,10 @@ import urllib.request
 import urllib.error
 import re
 import time
+import base64
 from datetime import datetime
+
+from openpyxl import load_workbook
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -524,6 +527,107 @@ def get_consensus_for_ticker(ticker: str) -> pd.DataFrame:
         .sort_values("year")
         .reset_index(drop=True)
     )
+
+
+def save_consensus_edits_to_github(ticker: str, edited: pd.DataFrame) -> tuple[bool, str]:
+    """현재 종목의 연도별 영업이익/목표POR를 consensus.xlsx에 반영하고 GitHub에 저장."""
+    try:
+        token = str(st.secrets["GITHUB_TOKEN"]).strip()
+    except Exception:
+        return False, "Streamlit Secrets에 GITHUB_TOKEN이 없습니다."
+    if not token:
+        return False, "GITHUB_TOKEN이 비어 있습니다."
+    if not os.path.exists(CONSENSUS_XLSX):
+        return False, "data/consensus.xlsx 파일이 없습니다."
+
+    try:
+        wb = load_workbook(CONSENSUS_XLSX)
+        if "컨센서스입력" not in wb.sheetnames:
+            return False, "consensus.xlsx에 '컨센서스입력' 시트가 없습니다."
+        ws = wb["컨센서스입력"]
+
+        # 실제 컬럼명은 2행에 있음
+        headers = {str(c.value).strip(): c.column for c in ws[2] if c.value is not None}
+        if "종목코드" not in headers:
+            return False, "종목코드 열을 찾지 못했습니다."
+
+        target = str(ticker).zfill(6)
+        target_row = None
+        for r in range(3, ws.max_row + 1):
+            raw = ws.cell(r, headers["종목코드"]).value
+            code = str(raw).strip().replace(".0", "").zfill(6) if raw is not None else ""
+            if code == target:
+                target_row = r
+                break
+        if target_row is None:
+            return False, f"{target} 종목을 consensus.xlsx에서 찾지 못했습니다."
+
+        for _, row in edited.iterrows():
+            year = int(row["연도"])
+            year_col_name = None
+            for candidate in (str(year), f"{year}E"):
+                if candidate in headers:
+                    year_col_name = candidate
+                    break
+            if year_col_name is None:
+                # 없는 연도 열은 오른쪽에 새로 생성
+                new_col = ws.max_column + 1
+                ws.cell(2, new_col).value = f"{year}E"
+                headers[f"{year}E"] = new_col
+                year_col_name = f"{year}E"
+
+            oi = pd.to_numeric(row.get("예상 영업이익(억)"), errors="coerce")
+            ws.cell(target_row, headers[year_col_name]).value = None if pd.isna(oi) else float(oi)
+
+        if "목표POR" in headers and "목표 POR" in edited.columns:
+            vals = pd.to_numeric(edited["목표 POR"], errors="coerce").dropna()
+            if not vals.empty:
+                ws.cell(target_row, headers["목표POR"]).value = float(vals.iloc[0])
+
+        if "업데이트일" in headers:
+            ws.cell(target_row, headers["업데이트일"]).value = datetime.now().strftime("%Y-%m-%d")
+
+        tmp = os.path.join(DATA_DIR, "consensus_edited.xlsx")
+        wb.save(tmp)
+        content = open(tmp, "rb").read()
+
+        api_url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/data/consensus.xlsx"
+        headers_http = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "POR-Alpha",
+        }
+        req = urllib.request.Request(api_url, headers=headers_http, method="GET")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            meta = json.loads(resp.read().decode("utf-8"))
+        sha = meta.get("sha")
+        if not sha:
+            return False, "GitHub의 consensus.xlsx SHA를 읽지 못했습니다."
+
+        payload = json.dumps({
+            "message": f"Update consensus {target}",
+            "content": base64.b64encode(content).decode("ascii"),
+            "sha": sha,
+            "branch": "main",
+        }).encode("utf-8")
+        req = urllib.request.Request(api_url, data=payload, headers={**headers_http, "Content-Type": "application/json"}, method="PUT")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            if resp.status not in (200, 201):
+                return False, f"GitHub 저장 실패: HTTP {resp.status}"
+
+        # 현재 실행 중인 앱에서도 즉시 새 값 사용
+        os.replace(tmp, CONSENSUS_XLSX)
+        load_consensus_excel.clear()
+        return True, "컨센서스를 GitHub data/consensus.xlsx에 저장했습니다."
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8")
+        except Exception:
+            detail = str(e)
+        return False, f"GitHub 저장 오류 HTTP {e.code}: {detail[:300]}"
+    except Exception as e:
+        return False, f"저장 중 오류: {e}"
 
 
 def request_daily_collection(ticker: str, name: str) -> tuple[bool, str]:
@@ -2019,97 +2123,76 @@ if run:
 
     if valuation_metric == "POR" and not consensus_df.empty:
         st.markdown("### 저장된 연도별 영업이익 컨센서스")
+        st.caption("예상 영업이익을 여기서 직접 수정한 뒤 **컨센서스 저장**을 누르면 GitHub의 data/consensus.xlsx에도 저장됩니다.")
 
+        edit_source = consensus_df[["year", "operating_income_eok", "target_por"]].copy()
+        edit_source["year"] = pd.to_numeric(edit_source["year"], errors="coerce").astype("Int64")
+        edit_source["operating_income_eok"] = pd.to_numeric(edit_source["operating_income_eok"], errors="coerce")
+        edit_source["target_por"] = pd.to_numeric(edit_source["target_por"], errors="coerce")
+        edit_source = edit_source.rename(columns={
+            "year": "연도",
+            "operating_income_eok": "예상 영업이익(억)",
+            "target_por": "목표 POR",
+        })
+
+        edited_consensus = st.data_editor(
+            edit_source,
+            hide_index=True,
+            use_container_width=True,
+            disabled=["연도"],
+            num_rows="fixed",
+            column_config={
+                "연도": st.column_config.NumberColumn("연도", format="%d"),
+                "예상 영업이익(억)": st.column_config.NumberColumn("예상 영업이익(억)", format="%.1f", step=1.0),
+                "목표 POR": st.column_config.NumberColumn("목표 POR", format="%.2f", step=0.1),
+            },
+            key=f"inline_consensus_editor_{ticker}",
+        )
+
+        save_c1, save_c2 = st.columns([1, 3])
+        with save_c1:
+            if st.button("💾 컨센서스 저장", type="primary", use_container_width=True, key=f"save_inline_consensus_{ticker}"):
+                ok, msg = save_consensus_edits_to_github(ticker, edited_consensus)
+                if ok:
+                    st.success(msg)
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.error(msg)
+        with save_c2:
+            st.caption("저장 후 현재 시총 기준 POR · 목표 시총 · 목표주가 · 상승여력 · 미래 초록점이 새 컨센서스로 다시 계산됩니다.")
+
+        # 편집 중에도 아래 계산표는 입력값을 즉시 반영
         consensus_show = consensus_df.copy()
+        edited_map = dict(zip(edited_consensus["연도"].astype(int), pd.to_numeric(edited_consensus["예상 영업이익(억)"], errors="coerce")))
+        consensus_show["operating_income_eok"] = consensus_show["year"].astype(int).map(edited_map).fillna(consensus_show["operating_income_eok"])
+
         current_mcap_eok_consensus = latest["market_cap"] / 100_000_000
-
-        consensus_show["현재 시총 기준 POR"] = (
-            current_mcap_eok_consensus
-            / consensus_show["operating_income_eok"]
-        )
-
-        consensus_show["적용 목표 POR"] = (
-            consensus_show["target_por"]
-            .where(
-                consensus_show["target_por"] > 0,
-                float(target_por_slider),
-            )
-        )
-
-        consensus_show["목표 시가총액(억)"] = (
-            consensus_show["operating_income_eok"]
-            * consensus_show["적용 목표 POR"]
-        )
+        consensus_show["현재 시총 기준 POR"] = current_mcap_eok_consensus / consensus_show["operating_income_eok"]
+        consensus_show["적용 목표 POR"] = consensus_show["target_por"].where(consensus_show["target_por"] > 0, float(target_por_slider))
+        consensus_show["목표 시가총액(억)"] = consensus_show["operating_income_eok"] * consensus_show["적용 목표 POR"]
 
         if current_price and current_mcap_eok_consensus > 0:
-            consensus_show["목표 주가(원)"] = (
-                current_price
-                * consensus_show["목표 시가총액(억)"]
-                / current_mcap_eok_consensus
-            )
-            consensus_show["상승여력(%)"] = (
-                consensus_show["목표 주가(원)"]
-                / current_price - 1
-            ) * 100
+            consensus_show["목표 주가(원)"] = current_price * consensus_show["목표 시가총액(억)"] / current_mcap_eok_consensus
+            consensus_show["상승여력(%)"] = (consensus_show["목표 주가(원)"] / current_price - 1) * 100
         else:
             consensus_show["목표 주가(원)"] = None
             consensus_show["상승여력(%)"] = None
 
-        consensus_show["연도"] = (
-            consensus_show["year"].astype(int).astype(str) + "E"
-        )
-        consensus_show["예상 영업이익(억)"] = (
-            consensus_show["operating_income_eok"].round(1)
-        )
-        consensus_show["현재 시총 기준 POR"] = (
-            consensus_show["현재 시총 기준 POR"].round(2)
-        )
-        consensus_show["적용 목표 POR"] = (
-            consensus_show["적용 목표 POR"].round(2)
-        )
-        consensus_show["목표 시가총액(억)"] = (
-            consensus_show["목표 시가총액(억)"].round(1)
-        )
-        consensus_show["목표 주가(원)"] = (
-            pd.to_numeric(
-                consensus_show["목표 주가(원)"],
-                errors="coerce",
-            ).round(0)
-        )
-        consensus_show["상승여력(%)"] = (
-            pd.to_numeric(
-                consensus_show["상승여력(%)"],
-                errors="coerce",
-            ).round(1)
-        )
+        consensus_show["연도"] = consensus_show["year"].astype(int).astype(str) + "E"
+        consensus_show["예상 영업이익(억)"] = consensus_show["operating_income_eok"].round(1)
+        for c in ["현재 시총 기준 POR", "적용 목표 POR"]:
+            consensus_show[c] = pd.to_numeric(consensus_show[c], errors="coerce").round(2)
+        consensus_show["목표 시가총액(억)"] = pd.to_numeric(consensus_show["목표 시가총액(억)"], errors="coerce").round(1)
+        consensus_show["목표 주가(원)"] = pd.to_numeric(consensus_show["목표 주가(원)"], errors="coerce").round(0)
+        consensus_show["상승여력(%)"] = pd.to_numeric(consensus_show["상승여력(%)"], errors="coerce").round(1)
 
+        st.markdown("#### 수정값 기준 계산")
         st.dataframe(
-            consensus_show[
-                [
-                    "연도",
-                    "예상 영업이익(억)",
-                    "현재 시총 기준 POR",
-                    "적용 목표 POR",
-                    "목표 시가총액(억)",
-                    "목표 주가(원)",
-                    "상승여력(%)",
-                    "source",
-                    "updated_at",
-                    "note",
-                ]
-            ].rename(columns={
-                "source": "출처",
-                "updated_at": "업데이트일",
-                "note": "비고",
-            }),
-            use_container_width=True,
-            hide_index=True,
+            consensus_show[["연도", "예상 영업이익(억)", "현재 시총 기준 POR", "적용 목표 POR", "목표 시가총액(억)", "목표 주가(원)", "상승여력(%)", "source", "updated_at", "note"]].rename(columns={"source":"출처", "updated_at":"업데이트일", "note":"비고"}),
+            use_container_width=True, hide_index=True,
         )
-
-        st.caption(
-            f"사이드바 {expected_base_label}을 직접 입력하면 수동값 우선. "
-            "0이면 엑셀의 가장 가까운 미래 연도가 자동 적용됩니다."
-        )
+        st.caption(f"사이드바 {expected_base_label}을 직접 입력하면 수동값 우선. 0이면 선택한 예상연도의 저장 컨센서스가 자동 적용됩니다.")
 
     # v46.3: 선택 지표별 목표 배수 계산
     target_calc_base_eok = (
