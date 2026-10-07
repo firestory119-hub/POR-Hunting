@@ -896,7 +896,7 @@ def plot_valuation(val_df: pd.DataFrame, title: str, metric: str, chart_range: s
                     mode="lines",
                     name="주가",
                     yaxis="y2",
-                    line=dict(width=1.5),
+                    line=dict(color="red", width=2.2),
                     hovertemplate=(
                         "<b>%{x|%Y-%m-%d}</b><br>"
                         "주가: %{y:,.0f}원"
